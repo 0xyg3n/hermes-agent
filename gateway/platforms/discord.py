@@ -660,6 +660,25 @@ class DiscordAdapter(BasePlatformAdapter):
                 if message.type not in (discord.MessageType.default, discord.MessageType.reply):
                     return
 
+                # DM lockdown: only Giannis can DM Laira.
+                # Non-Giannis users can still reach her in guild channels
+                # (governed by user/role allowlists), but DMs from anyone
+                # else are dropped at the gateway. Prevents DM-only social
+                # engineering attacks. Controlled by DISCORD_BLOCK_DMS_FROM_NON_GIANNIS.
+                if isinstance(message.channel, discord.DMChannel):
+                    block_dms = os.getenv(
+                        "DISCORD_BLOCK_DMS_FROM_NON_GIANNIS", "false"
+                    ).lower().strip() in ("1", "true", "yes", "on")
+                    giannis_id = os.getenv(
+                        "GIANNIS_DISCORD_ID", "1085530082803716118"
+                    )
+                    if block_dms and str(message.author.id) != giannis_id:
+                        logger.info(
+                            "[%s] DM from %s blocked by DISCORD_BLOCK_DMS_FROM_NON_GIANNIS lockdown",
+                            self.name, message.author.id,
+                        )
+                        return
+
                 # Bot message filtering (DISCORD_ALLOW_BOTS):
                 #   "none"     — ignore all other bots (default)
                 #   "mentions" — accept bot messages only when they @mention us
