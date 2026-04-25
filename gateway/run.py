@@ -3981,15 +3981,16 @@ class GatewayRunner:
             if allow_bots in ("mentions", "all"):
                 return True
 
-        # Discord role-based access (DISCORD_ALLOWED_ROLES): the adapter's
-        # on_message pre-filter already verified role membership — if the
-        # message reached here, the user passed that check. Authorize
-        # directly to avoid the "no allowlists configured" branch below
-        # rejecting role-only setups where DISCORD_ALLOWED_USERS is empty
-        # (issue #7871).
+        # Discord role-based access (DISCORD_ALLOWED_ROLES) is valid only for
+        # guild/channel messages where roles can actually be observed. A DM
+        # from a guild member must NOT inherit role authorization here: that
+        # would let any role-allowed server member bypass the DM lockdown.
+        # For DMs, fall through to explicit user allowlists / pairing store / 
+        # adapter checks below.
         if (
             source.platform == Platform.DISCORD
             and os.getenv("DISCORD_ALLOWED_ROLES", "").strip()
+            and getattr(source, "chat_type", "dm") != "dm"
         ):
             return True
 
