@@ -1752,8 +1752,8 @@ class BasePlatformAdapter(ABC):
                 # All retries exhausted (loop completed without break) — notify user
                 logger.error("[%s] Failed to deliver response after %d retries: %s", self.name, max_retries, error_str)
                 notice = (
-                    "\u26a0\ufe0f απεστειλε πολλες φορες και δεν περασε. "
-                    "Η απαντηση ετοιμαστηκε αλλα κολλησε η παραδοση, ξαναπες μου."
+                    "\u26a0\ufe0f Message delivery failed after multiple attempts. "
+                    "Please try again \u2014 your request was processed but the response could not be sent."
                 )
                 try:
                     await self.send(chat_id=chat_id, content=notice, reply_to=reply_to, metadata=metadata)
@@ -2414,9 +2414,9 @@ class BasePlatformAdapter(ABC):
                 await self.send(
                     chat_id=event.source.chat_id,
                     content=(
-                        f"κολλησα ({error_type}).\n"
+                        f"Sorry, I encountered an error ({error_type}).\n"
                         f"{error_detail}\n"
-                        "ξαναπες, η /reset."
+                        "Try again or use /reset to start a fresh session."
                     ),
                     metadata=_thread_metadata,
                 )
