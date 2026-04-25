@@ -4095,7 +4095,7 @@ class GatewayRunner:
         # discord.py client/guild cache — something the gateway layer
         # cannot replicate on its own.
         if source.platform == Platform.DISCORD:
-            adapter = self.adapters.get(Platform.DISCORD)
+            adapter = getattr(self, "adapters", {}).get(Platform.DISCORD)
             if adapter and hasattr(adapter, "_is_allowed_user"):
                 _is_dm = getattr(source, "chat_type", "dm") == "dm"
                 if adapter._is_allowed_user(user_id, is_dm=_is_dm):
@@ -4136,7 +4136,22 @@ class GatewayRunner:
         import secrets
         return f"ha_{secrets.token_hex(4)}"
 
+    def _ensure_human_approval_state(self) -> None:
+        """Initialize human-approval state for lightweight test runners.
+
+        Most production instances go through ``__init__``, but several gateway
+        tests intentionally build ``GatewayRunner`` with ``object.__new__`` to
+        exercise narrow code paths without booting adapters. Human approval
+        handling runs early in ``_handle_message()``, so keep this state lazy
+        instead of forcing every test skeleton to mirror ``__init__``.
+        """
+        if not hasattr(self, "_pending_human_approvals"):
+            self._pending_human_approvals = {}
+        if not hasattr(self, "_pending_human_approvals_lock"):
+            self._pending_human_approvals_lock = threading.Lock()
+
     def _prune_expired_human_approvals(self) -> None:
+        self._ensure_human_approval_state()
         now = time.time()
         with self._pending_human_approvals_lock:
             expired = [
