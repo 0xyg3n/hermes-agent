@@ -6808,7 +6808,21 @@ class HermesCLI:
 
         Returns True if a launch command was executed (doesn't guarantee success).
         """
-        return try_launch_chrome_debug(port, system)
+        # Read browser.startup_urls from CLI_CONFIG (string or list) and
+        # forward them to the helper so Chrome opens the configured pages
+        # in the dedicated debug profile. Empty/missing config preserves
+        # the previous no-URL behavior.
+        startup_urls: list[str] = []
+        try:
+            browser_cfg = (CLI_CONFIG.get("browser") or {}) if isinstance(CLI_CONFIG, dict) else {}
+            raw_urls = browser_cfg.get("startup_urls") or []
+            if isinstance(raw_urls, str):
+                raw_urls = [u.strip() for u in raw_urls.split(",")]
+            if isinstance(raw_urls, list):
+                startup_urls = [str(u).strip() for u in raw_urls if str(u).strip()]
+        except Exception:
+            startup_urls = []
+        return try_launch_chrome_debug(port, system, startup_urls=startup_urls)
 
     def _handle_browser_command(self, cmd: str):
         """Handle /browser connect|disconnect|status — manage live Chrome CDP connection."""

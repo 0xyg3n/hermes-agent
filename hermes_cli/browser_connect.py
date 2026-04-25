@@ -119,16 +119,24 @@ def _detach_kwargs(system: str) -> dict:
     return {"creationflags": flags} if flags else {}
 
 
-def try_launch_chrome_debug(port: int = DEFAULT_BROWSER_CDP_PORT, system: str | None = None) -> bool:
+def try_launch_chrome_debug(
+    port: int = DEFAULT_BROWSER_CDP_PORT,
+    system: str | None = None,
+    startup_urls: list[str] | None = None,
+) -> bool:
     system = system or platform.system()
     candidates = get_chrome_debug_candidates(system)
     if not candidates:
         return False
 
     os.makedirs(chrome_debug_data_dir(), exist_ok=True)
+    # Optional positional startup URLs (passed in by callers that read
+    # browser.startup_urls from CLI_CONFIG) — appended after the flags so
+    # Chrome opens the configured pages in the dedicated debug profile.
+    extra_args = list(startup_urls or [])
     try:
         subprocess.Popen(
-            [candidates[0], *_chrome_debug_args(port)],
+            [candidates[0], *_chrome_debug_args(port), *extra_args],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             **_detach_kwargs(system),
