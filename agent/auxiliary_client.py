@@ -470,26 +470,32 @@ class _CodexCompletionsAdapter:
         messages = kwargs.get("messages", [])
         model = kwargs.get("model", self._model)
 
-        # Separate system/instructions from conversation messages.
-        # Convert chat.completions multimodal content blocks to Responses
-        # API format (input_text / input_image instead of text / image_url).
+        # Pull the first system message off as Responses `instructions`;
+        # the converter below skips system messages, so this is the only
+        # place we surface them.
         instructions = "You are a helpful assistant."
-        input_msgs: List[Dict[str, Any]] = []
         for msg in messages:
-            role = msg.get("role", "user")
-            content = msg.get("content") or ""
-            if role == "system":
-                instructions = content if isinstance(content, str) else str(content)
-            else:
-                input_msgs.append({
-                    "role": role,
-                    "content": _convert_content_for_responses(content),
-                })
+            if isinstance(msg, dict) and msg.get("role") == "system":
+                sysc = msg.get("content") or ""
+                instructions = sysc if isinstance(sysc, str) else str(sysc)
+                break
+
+        # Convert chat-style messages (user/assistant/tool, including
+        # assistant.tool_calls and tool-result messages) to the Responses
+        # input-item shape. The Responses API rejects role=="tool" outright
+        # ("Invalid value: 'tool'. Supported values are: 'assistant',
+        # 'system', 'developer', and 'user'"), so we delegate to the same
+        # converter the main Codex Responses adapter uses, which emits
+        # function_call / function_call_output items for tool turns.
+        from agent.codex_responses_adapter import _chat_messages_to_responses_input
+        input_msgs = _chat_messages_to_responses_input(messages)
+        if not input_msgs:
+            input_msgs = [{"role": "user", "content": ""}]
 
         resp_kwargs: Dict[str, Any] = {
             "model": model,
             "instructions": instructions,
-            "input": input_msgs or [{"role": "user", "content": ""}],
+            "input": input_msgs,
             "store": False,
         }
 

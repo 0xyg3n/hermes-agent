@@ -1752,3 +1752,84 @@ class TestVisionAutoSkipsKimiCoding:
             "kimi-coding",
             "kimi-coding-cn",
         })
+class TestCodexCompletionsAdapterInputConversion:
+    """The Responses API rejects role=='tool' (only assistant/system/developer/
+    user are accepted). _CodexCompletionsAdapter.create must convert tool
+    messages to function_call_output items and assistant.tool_calls to
+    function_call items before calling responses.stream(...).
+    """
+
+    def _make_adapter_with_capture(self):
+        from agent.auxiliary_client import _CodexCompletionsAdapter
+
+        captured = {}
+
+        class _StreamCtx:
+            def __enter__(self_inner):
+                return self_inner
+
+            def __exit__(self_inner, *exc):
+                return False
+
+            def __iter__(self_inner):
+                return iter([])
+
+            def get_final_response(self_inner):
+                from types import SimpleNamespace
+                return SimpleNamespace(output=[], usage=None)
+
+        class _RespClient:
+            def stream(self_inner, **kwargs):
+                captured["resp_kwargs"] = kwargs
+                return _StreamCtx()
+
+        class _RealClient:
+            def __init__(self_inner):
+                self_inner.responses = _RespClient()
+
+        return _CodexCompletionsAdapter(_RealClient(), "gpt-5.5"), captured
+
+    def test_tool_message_converts_to_function_call_output(self):
+        adapter, captured = self._make_adapter_with_capture()
+        adapter.create(messages=[
+            {"role": "system", "content": "sys-prompt"},
+            {"role": "user", "content": "save this"},
+            {"role": "assistant", "content": "",
+             "tool_calls": [{"id": "call_xyz",
+                             "function": {"name": "memory",
+                                          "arguments": '{"action":"add"}'}}]},
+            {"role": "tool", "tool_call_id": "call_xyz", "content": "Saved."},
+        ])
+
+        resp_kwargs = captured["resp_kwargs"]
+        assert resp_kwargs["instructions"] == "sys-prompt"
+
+        items = resp_kwargs["input"]
+        roles_or_types = [it.get("role") or it.get("type") for it in items]
+        assert "tool" not in roles_or_types, (
+            f"Codex Responses API rejects role=='tool'; got items={items!r}"
+        )
+
+        types = [it.get("type") for it in items]
+        assert "function_call" in types
+        assert "function_call_output" in types
+
+        out_item = next(it for it in items if it.get("type") == "function_call_output")
+        assert out_item["call_id"] == "call_xyz"
+        assert out_item["output"] == "Saved."
+
+    def test_only_user_message_still_works(self):
+        adapter, captured = self._make_adapter_with_capture()
+        adapter.create(messages=[{"role": "user", "content": "hello"}])
+
+        items = captured["resp_kwargs"]["input"]
+        assert len(items) == 1
+        assert items[0]["role"] == "user"
+        assert items[0]["content"] == "hello"
+
+    def test_empty_messages_emits_placeholder_user(self):
+        adapter, captured = self._make_adapter_with_capture()
+        adapter.create(messages=[])
+
+        items = captured["resp_kwargs"]["input"]
+        assert items == [{"role": "user", "content": ""}]
