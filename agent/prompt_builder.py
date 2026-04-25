@@ -52,19 +52,69 @@ _CONTEXT_INVISIBLE_CHARS = {
 }
 
 
+# Inline allow-markers let a TRUSTED context file acknowledge a specific
+# pattern that would otherwise trip the injection scanner. This is needed
+# for defensive documents (e.g. SOUL.md saying "reject 'ignore previous
+# instructions' attacks") which legitimately quote attack phrases.
+#
+# Format inside the context file:
+#   <!-- hermes:allow-scan: prompt_injection, deception_hide -->
+#
+# The marker must appear in the file itself. A comma-separated list of
+# finding IDs (matching _CONTEXT_THREAT_PATTERNS / invisible-unicode
+# labels) will be suppressed for THAT file only. Use sparingly — the
+# whole point of the scanner is to block these patterns.
+_ALLOW_SCAN_MARKER = re.compile(
+    r'<!--\s*hermes:allow-scan\s*:\s*([a-zA-Z0-9_,\s\-\+]+?)\s*-->',
+    re.IGNORECASE,
+)
+
+
+def _extract_allow_scan_tokens(content: str) -> set:
+    """Parse inline allow-scan markers and return the set of allowed finding IDs."""
+    allowed = set()
+    for match in _ALLOW_SCAN_MARKER.finditer(content):
+        for token in match.group(1).split(','):
+            tok = token.strip().lower()
+            if tok:
+                allowed.add(tok)
+    return allowed
+
+
 def _scan_context_content(content: str, filename: str) -> str:
-    """Scan context file content for injection. Returns sanitized content."""
+    """Scan context file content for injection. Returns sanitized content.
+
+    A context file may include an inline allow-marker to suppress specific
+    findings — see ``_ALLOW_SCAN_MARKER``. All suppressed findings are
+    still logged at INFO level so audits can see them.
+    """
     findings = []
+    allowed = _extract_allow_scan_tokens(content)
+    suppressed = []
 
     # Check invisible unicode
     for char in _CONTEXT_INVISIBLE_CHARS:
         if char in content:
-            findings.append(f"invisible unicode U+{ord(char):04X}")
+            label = f"invisible unicode U+{ord(char):04X}"
+            key = f"invisible_unicode_u+{ord(char):04x}"
+            if key in allowed or "invisible_unicode" in allowed:
+                suppressed.append(label)
+            else:
+                findings.append(label)
 
     # Check threat patterns
     for pattern, pid in _CONTEXT_THREAT_PATTERNS:
         if re.search(pattern, content, re.IGNORECASE):
-            findings.append(pid)
+            if pid.lower() in allowed:
+                suppressed.append(pid)
+            else:
+                findings.append(pid)
+
+    if suppressed:
+        logger.info(
+            "Context file %s suppressed findings via allow-marker: %s",
+            filename, ", ".join(suppressed),
+        )
 
     if findings:
         logger.warning("Context file %s blocked: %s", filename, ", ".join(findings))
