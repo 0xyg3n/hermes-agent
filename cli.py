@@ -6493,6 +6493,17 @@ class HermesCLI:
         os.makedirs(data_dir, exist_ok=True)
 
         chrome = candidates[0]
+        startup_urls = []
+        try:
+            browser_cfg = (CLI_CONFIG.get("browser") or {}) if isinstance(CLI_CONFIG, dict) else {}
+            raw_urls = browser_cfg.get("startup_urls") or []
+            if isinstance(raw_urls, str):
+                raw_urls = [u.strip() for u in raw_urls.split(",")]
+            if isinstance(raw_urls, list):
+                startup_urls = [str(u).strip() for u in raw_urls if str(u).strip()]
+        except Exception:
+            startup_urls = []
+
         try:
             _sp.Popen(
                 [
@@ -6501,6 +6512,7 @@ class HermesCLI:
                     f"--user-data-dir={data_dir}",
                     "--no-first-run",
                     "--no-default-browser-check",
+                    *startup_urls,
                 ],
                 stdout=_sp.DEVNULL,
                 stderr=_sp.DEVNULL,

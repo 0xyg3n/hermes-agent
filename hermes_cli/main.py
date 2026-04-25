@@ -6319,8 +6319,7 @@ def cmd_profile(args):
 def cmd_dashboard(args):
     """Start the web UI server."""
     try:
-        import fastapi  # noqa: F401
-        import uvicorn  # noqa: F401
+        from hermes_cli.web_server import start_server as _check_web  # noqa: F401
     except ImportError:
         print("Web UI dependencies not installed.")
         print(f"Install them with:  {sys.executable} -m pip install 'fastapi' 'uvicorn[standard]'")
