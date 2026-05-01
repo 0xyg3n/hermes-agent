@@ -844,6 +844,22 @@ def refresh_anthropic_oauth_pure(refresh_token: str, *, use_json: bool = False) 
 
 def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
     """Attempt to refresh an expired Claude Code OAuth token."""
+    # Container-side refresh opt-out.  When this Hermes process shares its
+    # ~/.claude/.credentials.json with a host-side Claude Code session via
+    # a bind mount, calling /v1/oauth/token here rotates the refresh_token
+    # in the shared file — and the host session's cached refresh_token
+    # immediately becomes invalid.  On its next refresh attempt the host
+    # is silently logged out.  Setting HERMES_DISABLE_OAUTH_REFRESH=1
+    # defers to the host: just return the current access_token and let
+    # the credential pool re-read the file on the next call (the host
+    # will have rotated by then if the token actually expired).
+    if os.environ.get("HERMES_DISABLE_OAUTH_REFRESH", "").lower() in ("1", "true", "yes"):
+        logger.debug(
+            "HERMES_DISABLE_OAUTH_REFRESH=1 — skipping container-side refresh "
+            "(host owns the refresh lifecycle)"
+        )
+        return creds.get("accessToken") or None
+
     refresh_token = creds.get("refreshToken", "")
     if not refresh_token:
         logger.debug("No refresh token available — cannot refresh")
