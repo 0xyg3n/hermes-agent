@@ -109,6 +109,10 @@ COMMAND_REGISTRY: list[CommandDef] = [
                cli_only=True),
     CommandDef("model", "Switch model for this session", "Configuration",
                aliases=("provider",), args_hint="[model] [--provider name] [--global]"),
+    CommandDef("openai", "Switch auth/model to OpenAI Codex GPT-5.5", "Configuration",
+               aliases=("gpt",)),
+    CommandDef("anthropic", "Switch auth/model to Anthropic Opus with GPT fallback", "Configuration",
+               ),
     CommandDef("gquota", "Show Google Gemini Code Assist quota usage", "Info",
                cli_only=True),
 

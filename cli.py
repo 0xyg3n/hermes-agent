@@ -5739,6 +5739,41 @@ class HermesCLI:
         else:
             _cprint("    (session only — add --global to persist)")
 
+    def _handle_auth_profile_switch(self, cmd_original: str, profile: str) -> None:
+        """Handle /openai and /anthropic shortcuts in the interactive CLI."""
+        from hermes_cli.auth_switch import (
+            ANTHROPIC_PROVIDER,
+            GPT_MODEL,
+            GPT_PROVIDER,
+            finalize_profile_config,
+            resolve_profile_target,
+        )
+
+        parts = cmd_original.split(None, 1)
+        raw_args = parts[1].strip() if len(parts) > 1 else ""
+        if raw_args:
+            _cprint(f"  Usage: /{profile}")
+            return
+
+        provider, model = resolve_profile_target(profile)
+
+        self._handle_model_switch(f"/model {model} --provider {provider} --global")
+        if self.provider != provider or self.model != model:
+            return
+        final_state = finalize_profile_config(profile, model)
+
+        if provider == GPT_PROVIDER:
+            _cprint("    Auth: OpenAI Codex")
+        elif provider == ANTHROPIC_PROVIDER:
+            _cprint("    Auth: Anthropic")
+            _cprint(f"    Fallback on Anthropic rate limit: {GPT_MODEL} via OpenAI Codex")
+        elif final_state.get("fallback_providers"):
+            fallback = final_state["fallback_providers"][0]
+            _cprint(
+                f"    Fallback: {fallback.get('model')} via "
+                f"{fallback.get('provider')}"
+            )
+
     def _should_handle_model_command_inline(self, text: str, has_images: bool = False) -> bool:
         """Return True when /model should be handled immediately on the UI thread."""
         if not text or has_images or not _looks_like_slash_command(text):
@@ -5747,7 +5782,7 @@ class HermesCLI:
             from hermes_cli.commands import resolve_command
             base = text.split(None, 1)[0].lower().lstrip('/')
             cmd = resolve_command(base)
-            return bool(cmd and cmd.name == "model")
+            return bool(cmd and cmd.name in ("model", "openai", "anthropic"))
         except Exception:
             return False
 
@@ -6400,6 +6435,8 @@ class HermesCLI:
             self._handle_resume_command(cmd_original)
         elif canonical == "model":
             self._handle_model_switch(cmd_original)
+        elif canonical in ("openai", "anthropic"):
+            self._handle_auth_profile_switch(cmd_original, canonical)
         elif canonical == "gquota":
             self._handle_gquota_command(cmd_original)
 

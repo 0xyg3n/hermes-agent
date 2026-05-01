@@ -4573,8 +4573,8 @@ class GatewayRunner:
                     adapter._pending_messages[_quick_key] = queued_event
                 return "No active agent — /steer queued for the next turn."
 
-            # /model must not be used while the agent is running.
-            if _cmd_def_inner and _cmd_def_inner.name == "model":
+            # Model/auth switches must not race an active agent turn.
+            if _cmd_def_inner and _cmd_def_inner.name in ("model", "openai", "anthropic"):
                 return "Agent is running — wait or /stop first, then switch models."
 
             # /approve and /deny must bypass the running-agent interrupt path.
@@ -4859,6 +4859,9 @@ class GatewayRunner:
 
         if canonical == "model":
             return await self._handle_model_command(event)
+
+        if canonical in ("openai", "anthropic"):
+            return await self._handle_auth_profile_command(event, canonical)
 
         if canonical == "personality":
             return await self._handle_personality_command(event)
@@ -7368,6 +7371,50 @@ class GatewayRunner:
         else:
             lines.append("_(session only -- add `--global` to persist)_")
 
+        return "\n".join(lines)
+
+    async def _handle_auth_profile_command(
+        self,
+        event: MessageEvent,
+        profile: str,
+    ) -> str:
+        """Handle /openai and /anthropic provider-profile shortcuts."""
+        from hermes_cli.auth_switch import (
+            ANTHROPIC_PROVIDER,
+            GPT_MODEL,
+            GPT_PROVIDER,
+            finalize_profile_config,
+            resolve_profile_target,
+        )
+
+        raw_args = event.get_command_args().strip()
+        if raw_args:
+            return f"Usage: `/{profile}`"
+
+        provider, model = resolve_profile_target(profile)
+        original_text = event.text
+        event.text = f"/model {model} --provider {provider} --global"
+        try:
+            response = await self._handle_model_command(event)
+        finally:
+            event.text = original_text
+
+        if response and response.startswith("Error:"):
+            return response
+
+        final_state = finalize_profile_config(profile, model)
+        lines = [response or f"Model switched to `{model}`"]
+        if provider == GPT_PROVIDER:
+            lines.append("Auth: OpenAI Codex")
+        elif provider == ANTHROPIC_PROVIDER:
+            lines.append("Auth: Anthropic")
+            lines.append(f"Fallback on Anthropic rate limit: `{GPT_MODEL}` via OpenAI Codex")
+        if final_state.get("fallback_providers") and provider != ANTHROPIC_PROVIDER:
+            fallback = final_state["fallback_providers"][0]
+            lines.append(
+                "Fallback: "
+                f"`{fallback.get('model')}` via {fallback.get('provider')}"
+            )
         return "\n".join(lines)
 
     async def _handle_personality_command(self, event: MessageEvent) -> str:
