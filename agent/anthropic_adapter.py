@@ -1290,6 +1290,40 @@ def convert_tools_to_anthropic(tools: List[Dict]) -> List[Dict]:
     return result
 
 
+def _sniff_image_media_type(b64_data: str) -> Optional[str]:
+    """Return the real image media_type from the first few bytes of base64 data.
+
+    Source platforms (Discord especially) sometimes mislabel attachments
+    — a PNG saved with a .webp extension keeps content-type=image/webp, a
+    JPEG screenshot pasted from clipboard arrives as image/png, etc.
+    Anthropic strictly validates that the declared media_type matches the
+    bytes and rejects the request with HTTP 400 like:
+      "messages.N.content.M.image.source.base64: The image was specified
+       using the image/webp media type, but the image appears to be a
+       image/png image"
+    Sniffing magic bytes here lets the adapter override a wrong claim.
+    Returns None when the format isn't recognized — caller keeps the
+    upstream-declared media_type as a fallback.
+    """
+    import base64 as _b64
+    try:
+        # 16 base64 chars decode to 12 bytes — enough for every magic
+        # we check.  Any padding fix-up is fine because we only inspect
+        # the first decoded bytes.
+        head = _b64.b64decode(b64_data[:32] + "==", validate=False)[:12]
+    except Exception:
+        return None
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if head.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if head.startswith(b"GIF87a") or head.startswith(b"GIF89a"):
+        return "image/gif"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
 def _image_source_from_openai_url(url: str) -> Dict[str, str]:
     """Convert an OpenAI-style image URL/data URL into Anthropic image source."""
     url = str(url or "").strip()
@@ -1303,6 +1337,13 @@ def _image_source_from_openai_url(url: str) -> Dict[str, str]:
             mime_part = header[len("data:"):].split(";", 1)[0].strip()
             if mime_part.startswith("image/"):
                 media_type = mime_part
+        sniffed = _sniff_image_media_type(data)
+        if sniffed and sniffed != media_type:
+            logger.debug(
+                "Image media_type mismatch: declared=%s actual=%s — using actual",
+                media_type, sniffed,
+            )
+            media_type = sniffed
         return {
             "type": "base64",
             "media_type": media_type,
