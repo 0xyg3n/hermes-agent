@@ -3,6 +3,7 @@
 Covers all error paths in run_agent.py's run_conversation() for api_mode=anthropic_messages:
 - 429 rate limit → retried with backoff
 - 529 overloaded → retried with backoff
+- 409 conflict → retried with backoff and not routed to fallback
 - 400 bad request → non-retryable, immediate fail
 - 401 unauthorized → credential refresh + retry
 - 500 server error → retried with backoff
@@ -105,6 +106,13 @@ class _OverloadedError(Exception):
     def __init__(self):
         super().__init__("Error code: 529 - API is temporarily overloaded.")
         self.status_code = 529
+
+
+class _ConflictError(Exception):
+    """Simulates Anthropic 409 request conflict error."""
+    def __init__(self):
+        super().__init__("Error code: 409 - Conflict")
+        self.status_code = 409
 
 
 class _BadRequestError(Exception):
@@ -260,6 +268,56 @@ def test_529_overloaded_is_retried_and_recovers(monkeypatch):
     agent_cls = _make_agent_cls(_OverloadedError, recover_after=1)
     result = _run_with_agent(monkeypatch, agent_cls)
     assert result["final_response"] == "Recovered"
+
+
+def test_409_conflict_is_retried_and_recovers(monkeypatch):
+    """409 should be retried on Anthropic instead of falling back."""
+    agent_cls = _make_agent_cls(_ConflictError, recover_after=1)
+    result = _run_with_agent(monkeypatch, agent_cls)
+    assert result["final_response"] == "Recovered"
+
+
+def test_409_conflict_exhausts_without_fallback(monkeypatch):
+    """Persistent 409 must surface after retries, not switch to fallback."""
+    _patch_agent_bootstrap(monkeypatch)
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.build_anthropic_client", _fake_build_anthropic_client
+    )
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS", "false")
+
+    class _ConflictNoFallbackAgent(run_agent.AIAgent):
+        fallback_calls = 0
+
+        def __init__(self, *args, **kwargs):
+            kwargs.setdefault("skip_context_files", True)
+            kwargs.setdefault("skip_memory", True)
+            kwargs.setdefault("max_iterations", 4)
+            super().__init__(*args, **kwargs)
+            self._api_max_retries = 1
+            self._cleanup_task_resources = lambda task_id: None
+            self._persist_session = lambda messages, history=None: None
+            self._save_trajectory = lambda messages, user_message, completed: None
+            self._save_session_log = lambda messages: None
+
+        def _try_activate_fallback(self, reason=None):
+            type(self).fallback_calls += 1
+            return True
+
+        def run_conversation(self, user_message, conversation_history=None, task_id=None):
+            def _fake_api_call(api_kwargs, **kw):
+                raise _ConflictError()
+
+            self._interruptible_api_call = _fake_api_call
+            self._interruptible_streaming_api_call = _fake_api_call
+            return super().run_conversation(
+                user_message, conversation_history=conversation_history, task_id=task_id
+            )
+
+    _ConflictNoFallbackAgent.fallback_calls = 0
+    result = _run_with_agent(monkeypatch, _ConflictNoFallbackAgent)
+    assert _ConflictNoFallbackAgent.fallback_calls == 0
+    failure_text = str(result.get("final_response", "") or result.get("error", ""))
+    assert "409" in failure_text
 
 
 def test_429_exhausts_all_retries_before_raising(monkeypatch):

@@ -436,9 +436,15 @@ class CredentialPool:
             file_refresh = creds.get("refreshToken", "")
             file_access = creds.get("accessToken", "")
             file_expires = creds.get("expiresAt", 0)
-            # If the credentials file has a different token pair, sync it
-            if file_refresh and file_refresh != entry.refresh_token:
-                logger.debug("Pool entry %s: syncing tokens from credentials file (refresh token changed)", entry.id)
+            # If the credentials file has newer material, sync it and clear
+            # stale exhaustion. Claude Code may rotate only access/expiry on
+            # some auth paths, so compare all runtime credential fields.
+            if (
+                (file_access and file_access != entry.access_token)
+                or (file_refresh and file_refresh != entry.refresh_token)
+                or (file_expires and file_expires != entry.expires_at_ms)
+            ):
+                logger.debug("Pool entry %s: syncing tokens from credentials file", entry.id)
                 updated = replace(
                     entry,
                     access_token=file_access,
@@ -447,6 +453,9 @@ class CredentialPool:
                     last_status=None,
                     last_status_at=None,
                     last_error_code=None,
+                    last_error_reason=None,
+                    last_error_message=None,
+                    last_error_reset_at=None,
                 )
                 self._replace_entry(entry, updated)
                 self._persist()
@@ -1009,8 +1018,16 @@ class CredentialPool:
     def reset_statuses(self) -> int:
         count = 0
         new_entries = []
+        status_fields = (
+            "last_status",
+            "last_status_at",
+            "last_error_code",
+            "last_error_reason",
+            "last_error_message",
+            "last_error_reset_at",
+        )
         for entry in self._entries:
-            if entry.last_status or entry.last_status_at or entry.last_error_code:
+            if any(getattr(entry, field_name, None) is not None for field_name in status_fields):
                 new_entries.append(
                     replace(
                         entry,
@@ -1105,6 +1122,28 @@ def _upsert_entry(entries: List[PooledCredential], provider: str, source: str, p
             if existing.extra.get(key) != value:
                 extra_updates[key] = value
     if field_updates or extra_updates:
+        # Fresh credential material invalidates stale failure state. Without
+        # this, seeded sources such as Claude Code can update their token while
+        # the pool entry remains hidden behind an old last_status=exhausted.
+        credential_fields = {
+            "access_token",
+            "refresh_token",
+            "expires_at",
+            "expires_at_ms",
+            "agent_key",
+            "agent_key_expires_at",
+        }
+        if credential_fields.intersection(field_updates):
+            field_updates.update(
+                {
+                    "last_status": None,
+                    "last_status_at": None,
+                    "last_error_code": None,
+                    "last_error_reason": None,
+                    "last_error_message": None,
+                    "last_error_reset_at": None,
+                }
+            )
         if extra_updates:
             field_updates["extra"] = {**existing.extra, **extra_updates}
         entries[existing_idx] = replace(existing, **field_updates)

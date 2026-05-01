@@ -35,6 +35,7 @@ class FailoverReason(enum.Enum):
     # Server-side
     overloaded = "overloaded"            # 503/529 — provider overloaded, backoff
     server_error = "server_error"        # 500/502 — internal server error, retry
+    conflict = "conflict"                # 409 — concurrent request/session conflict, retry
 
     # Transport
     timeout = "timeout"                  # Connection/read timeout — rebuild client + retry
@@ -99,6 +100,8 @@ _BILLING_PATTERNS = [
     "payment required",
     "billing hard limit",
     "exceeded your current quota",
+    "out of extra usage",
+    "add more at claude.ai/settings/usage",
     "account is deactivated",
     "plan does not include",
 ]
@@ -622,6 +625,16 @@ def _classify_by_status(
             FailoverReason.payload_too_large,
             retryable=True,
             should_compress=True,
+        )
+
+    if status_code == 409:
+        # Anthropic returns 409 Conflict for transient request/session
+        # collisions. Treat it like backpressure: retry the same provider
+        # instead of switching auth/providers via fallback.
+        return result_fn(
+            FailoverReason.conflict,
+            retryable=True,
+            should_fallback=False,
         )
 
     if status_code == 429:

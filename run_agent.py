@@ -4115,7 +4115,7 @@ class AIAgent:
         if "reset_at" not in context:
             message = context.get("message") or ""
             if isinstance(message, str):
-                delay_match = re.search(r"quotaResetDelay[:\s\"]+(\\d+(?:\\.\\d+)?)(ms|s)", message, re.IGNORECASE)
+                delay_match = re.search(r"quotaResetDelay[:\s\"]+(\d+(?:\.\d+)?)(ms|s)", message, re.IGNORECASE)
                 if delay_match:
                     value = float(delay_match.group(1))
                     seconds = value / 1000.0 if delay_match.group(2).lower() == "ms" else value
@@ -11917,6 +11917,8 @@ class AIAgent:
                         classified.retryable, classified.should_compress,
                         classified.should_rotate_credential, classified.should_fallback,
                     )
+                    if status_code is None and classified.status_code is not None:
+                        status_code = classified.status_code
 
                     recovered_with_pool, has_retried_429 = self._recover_with_credential_pool(
                         status_code=status_code,
@@ -12630,16 +12632,23 @@ class AIAgent:
                             primary_recovery_attempted = True
                             retry_count = 0
                             continue
-                        # Try fallback before giving up entirely
-                        self._emit_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
-                        if self._try_activate_fallback():
-                            retry_count = 0
-                            compression_attempts = 0
-                            primary_recovery_attempted = False
-                            continue
+                        # 409 Conflict is a transient same-provider collision
+                        # (common on Anthropic when requests overlap). A GPT
+                        # fallback changes auth/model without fixing the
+                        # underlying contention, so surface it after retries.
+                        if classified.reason != FailoverReason.conflict:
+                            # Try fallback before giving up entirely
+                            self._emit_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
+                            if self._try_activate_fallback(reason=classified.reason):
+                                retry_count = 0
+                                compression_attempts = 0
+                                primary_recovery_attempted = False
+                                continue
                         _final_summary = self._summarize_api_error(api_error)
                         if is_rate_limited:
                             self._emit_status(f"❌ Rate limited after {max_retries} retries — {_final_summary}")
+                        elif classified.reason == FailoverReason.conflict:
+                            self._emit_status(f"❌ Request conflict after {max_retries} retries — {_final_summary}")
                         else:
                             self._emit_status(f"❌ API failed after {max_retries} retries — {_final_summary}")
                         self._vprint(f"{self.log_prefix}   💀 Final error: {_final_summary}", force=True)

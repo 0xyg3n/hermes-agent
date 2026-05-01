@@ -54,6 +54,7 @@ class TestFailoverReason:
         expected = {
             "auth", "auth_permanent", "billing", "rate_limit",
             "overloaded", "server_error", "timeout",
+            "conflict",
             "context_overflow", "payload_too_large", "image_too_large",
             "model_not_found", "format_error",
             "provider_policy_blocked",
@@ -290,6 +291,23 @@ class TestClassifyApiError:
         e = MockAPIError("Overloaded", status_code=529)
         result = classify_api_error(e)
         assert result.reason == FailoverReason.overloaded
+
+    def test_409_conflict_retries_without_fallback(self):
+        e = MockAPIError("Error code: 409 - Conflict", status_code=409)
+        result = classify_api_error(e, provider="anthropic", model="claude-opus-4-7")
+        assert result.reason == FailoverReason.conflict
+        assert result.retryable is True
+        assert result.should_fallback is False
+
+    def test_400_anthropic_out_of_extra_usage_is_billing(self):
+        e = MockAPIError(
+            "You're out of extra usage. Add more at claude.ai/settings/usage and keep going.",
+            status_code=400,
+        )
+        result = classify_api_error(e, provider="anthropic", model="claude-opus-4-7")
+        assert result.reason == FailoverReason.billing
+        assert result.retryable is False
+        assert result.should_fallback is True
 
     # ── Model not found ──
 

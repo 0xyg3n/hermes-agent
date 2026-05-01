@@ -9,6 +9,7 @@ import io
 import json
 import logging
 import re
+import time
 import uuid
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -3495,6 +3496,17 @@ class TestCredentialPoolRecovery:
         assert context["reason"] == "device_code_exhausted"
         assert context["message"] == "Weekly credits exhausted."
         assert context["reset_at"] == "2026-04-12T10:30:00Z"
+
+    def test_extract_api_error_context_parses_quota_reset_delay(self, agent):
+        class QuotaError(Exception):
+            pass
+
+        error = QuotaError('session limit hit quotaResetDelay: "2500ms"')
+        before = time.time()
+
+        context = agent._extract_api_error_context(error)
+
+        assert context["reset_at"] == pytest.approx(before + 2.5, abs=1.0)
 
     def test_recover_with_pool_passes_error_context_on_rotated_429(self, agent):
         next_entry = SimpleNamespace(label="secondary")

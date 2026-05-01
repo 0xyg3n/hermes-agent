@@ -461,6 +461,97 @@ def test_load_pool_removes_stale_file_backed_singleton_entry(tmp_path, monkeypat
     assert auth_payload["credential_pool"]["anthropic"] == []
 
 
+def test_load_pool_clears_exhausted_claude_code_entry_when_token_updates(tmp_path, monkeypatch):
+    """Fresh Claude Code credentials must clear stale session-limit state."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "anthropic": [
+                    {
+                        "id": "claude-1",
+                        "label": "claude_code",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "claude_code",
+                        "access_token": "old-access",
+                        "refresh_token": "old-refresh",
+                        "expires_at_ms": 1711234567000,
+                        "last_status": "exhausted",
+                        "last_status_at": time.time(),
+                        "last_error_code": 400,
+                        "last_error_message": "You're out of extra usage.",
+                    }
+                ]
+            },
+        },
+    )
+    monkeypatch.setattr("hermes_cli.auth.is_provider_explicitly_configured", lambda pid: pid == "anthropic")
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.read_hermes_oauth_credentials",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.read_claude_code_credentials",
+        lambda: {
+            "accessToken": "fresh-access",
+            "refreshToken": "fresh-refresh",
+            "expiresAt": int(time.time() * 1000) + 3_600_000,
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("anthropic")
+    entry = pool.select()
+
+    assert entry is not None
+    assert entry.access_token == "fresh-access"
+    assert entry.refresh_token == "fresh-refresh"
+    assert entry.last_status is None
+    assert entry.last_error_code is None
+
+
+def test_reset_statuses_clears_standalone_reset_metadata(tmp_path, monkeypatch):
+    """Manual provider switches must clear stale reset windows fully."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "anthropic": [
+                    {
+                        "id": "claude-reset",
+                        "label": "manual-anthropic",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "access",
+                        "refresh_token": "refresh",
+                        "expires_at_ms": int(time.time() * 1000) + 3_600_000,
+                        "last_error_reset_at": time.time() + 3_600,
+                    }
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("anthropic")
+    assert pool.reset_statuses() == 1
+    entry = pool.entries()[0]
+    assert entry.last_error_reset_at is None
+    assert entry.last_error_reason is None
+    assert entry.last_error_message is None
+
+
 def test_load_pool_migrates_nous_provider_state_preserves_tls(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     _write_auth_store(
