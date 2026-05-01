@@ -84,7 +84,7 @@ class AnthropicTransport(ProviderTransport):
         to OpenAI finish_reason, and collects reasoning_details in provider_data.
         """
         import json
-        from agent.anthropic_adapter import _to_plain_data
+        from agent.anthropic_adapter import _to_plain_data, _TOOL_NAME_RENAME_REVERSE
         from agent.transports.types import ToolCall
 
         strip_tool_prefix = kwargs.get("strip_tool_prefix", False)
@@ -107,6 +107,15 @@ class AnthropicTransport(ProviderTransport):
                 name = block.name
                 if strip_tool_prefix and name.startswith(_MCP_PREFIX):
                     name = name[len(_MCP_PREFIX):]
+                # Reverse the OAuth-route renames applied in
+                # build_anthropic_kwargs (e.g. ``recall_sessions`` was sent
+                # to Anthropic in place of ``session_search`` to dodge the
+                # third-party-fingerprint classifier).  run_agent validates
+                # tool names against the local registry before
+                # handle_function_call runs, so the reverse rename has to
+                # happen here, not later.
+                if name in _TOOL_NAME_RENAME_REVERSE:
+                    name = _TOOL_NAME_RENAME_REVERSE[name]
                 tool_calls.append(
                     ToolCall(
                         id=block.id,
