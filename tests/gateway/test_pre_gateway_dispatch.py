@@ -123,6 +123,10 @@ async def test_hook_allow_falls_through_to_auth(monkeypatch):
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_hook)
 
     runner, adapter = _make_runner(Platform.WHATSAPP)
+    # The hardened gateway default silently ignores unauthorized DMs. This
+    # test is specifically about proving hook action="allow" falls through to
+    # the legacy pairing path, so opt into pairing explicitly.
+    runner.config.unauthorized_dm_behavior = "pair"
     runner.pairing_store.generate_code.return_value = "12345"
 
     result = await runner._handle_message(_make_event("hi"))

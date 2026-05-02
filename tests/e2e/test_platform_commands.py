@@ -169,6 +169,7 @@ class TestAuthorization:
     async def test_unauthorized_user_gets_pairing_response(self, adapter, runner, platform):
         """Unauthorized DM should trigger pairing code, not a command response."""
         runner._is_user_authorized = lambda _source: False
+        runner.config.unauthorized_dm_behavior = "pair"
 
         event = make_event(platform, "/help")
         adapter.send.reset_mock()
