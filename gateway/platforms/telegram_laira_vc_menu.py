@@ -534,9 +534,11 @@ async def _dispatch_callback(query, payload: str) -> None:
     if payload == "join_giannis":
         await _ack("finding Giannis…")
         rc, out = _run_laira_vc("where", timeout=15)
-        # Parse "FOUND: ... channel=<name> (<channel_id>) ..."
+        # Parse "FOUND: ... channel=<name> (<channel_id>) self_mute=..."
+        # Anchor on the trailing " self_mute" so channel names with parens
+        # ("Lock In (No non-code talk)") don't trip a non-greedy match.
         import re
-        m = re.search(r'channel=.*?\((\d+)\)', out)
+        m = re.search(r'\((\d+)\)\s+self_mute=', out)
         if not m:
             await _edit(
                 f"❌ Giannis isn't in any voice channel I can see.\n\n```\n{out[-2000:]}\n```",
@@ -544,7 +546,7 @@ async def _dispatch_callback(query, payload: str) -> None:
             )
             return
         target_channel = m.group(1)
-        # Skip if already there
+        # Skip if already there AND stack is healthy
         from pathlib import Path as _P
         roster = _P("/tmp/discord-voice-roster.json")
         current = ""
@@ -553,15 +555,22 @@ async def _dispatch_callback(query, payload: str) -> None:
                 current = json.loads(roster.read_text()).get("channel_id", "")
             except Exception:
                 pass
-        if current == target_channel:
+        # Probe stack health — if anything's down, fall through to `up` instead of skipping
+        rc_st, out_st = _run_laira_vc("status", timeout=15)
+        stack_healthy = "✗" not in out_st
+        if current == target_channel and stack_healthy:
             await _edit(
-                f"✅ Already in his channel (`{target_channel}`).\n\n```\n{out[-1500:]}\n```",
+                f"✅ Already in his channel (`{target_channel}`).\n\n```\n{out_st[-1500:]}\n```",
                 _main_menu_kb(),
             )
             return
-        await _edit(f"found him in `{target_channel}` — switching…", _main_menu_kb())
+        # Use `up <channel>` instead of `switch` — `up` is idempotent and revives
+        # any dead components (page server, browser driver, host pulse, etc.)
+        # while `switch` only swaps stay.js and silently leaves a dead stack.
+        verb = "switching" if stack_healthy else "stack down — bringing up"
+        await _edit(f"found him in `{target_channel}` — {verb}…", _main_menu_kb())
         loop = asyncio.get_event_loop()
-        rc2, out2 = await loop.run_in_executor(None, _run_laira_vc, "switch", target_channel, 90)
+        rc2, out2 = await loop.run_in_executor(None, _run_laira_vc, "up", target_channel, 120)
         await _edit(
             f"*joined Giannis (rc={rc2}):*\n```\n{out2[-3000:]}\n```",
             _main_menu_kb(),
