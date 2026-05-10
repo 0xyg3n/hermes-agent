@@ -2627,6 +2627,55 @@ class DiscordAdapter(BasePlatformAdapter):
         async def slash_background(interaction: discord.Interaction, prompt: str):
             await self._run_simple_slash(interaction, f"/background {prompt}", "Background task started~")
 
+        # /laira <text> — direct steer to realtime Laira VC (speaks via OpenAI Realtime).
+        # Giannis-only. Calls the page-server /steer endpoint with X-Steer-Token auth.
+        @tree.command(name="laira", description="Send a message to realtime Laira (she'll speak it / act on it)")
+        @discord.app_commands.describe(message="What you want Laira to say or act on")
+        async def slash_laira(interaction: discord.Interaction, message: str):
+            # Auth: only Giannis can steer realtime Laira.
+            GIANNIS_DISCORD_ID = int(os.environ.get("GIANNIS_DISCORD_ID", "1085530082803716118"))
+            if interaction.user.id != GIANNIS_DISCORD_ID:
+                try:
+                    await interaction.response.send_message(
+                        "this command is private. ask Giannis.",
+                        ephemeral=True,
+                    )
+                except Exception:
+                    pass
+                return
+
+            # Defer ephemerally — keeps the channel clean, only Giannis sees the verdict.
+            try:
+                await interaction.response.defer(ephemeral=True, thinking=True)
+            except Exception:
+                pass
+
+            text = (message or "").strip()
+            if not text:
+                try:
+                    await interaction.followup.send("usage: `/laira <message>`", ephemeral=True)
+                except Exception:
+                    pass
+                return
+
+            # Steer call — runs in a thread so we don't block the event loop on httpx.
+            def _do_steer() -> tuple[bool, str]:
+                try:
+                    from gateway.platforms.telegram_laira_vc_menu import _post_steer
+                    return _post_steer(text, speak=True)
+                except Exception as exc:
+                    return False, f"steer import error: {exc}"
+
+            ok, info = await asyncio.to_thread(_do_steer)
+            verdict = "✅ steered" if ok else f"❌ {info}"
+            try:
+                await interaction.followup.send(
+                    f"{verdict}\n\n_text:_ {text[:300]}",
+                    ephemeral=True,
+                )
+            except Exception:
+                pass
+
         # ── Auto-register any gateway-available commands not yet on the tree ──
         # This ensures new commands added to COMMAND_REGISTRY in
         # hermes_cli/commands.py automatically appear as Discord slash

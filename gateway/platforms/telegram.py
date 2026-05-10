@@ -1817,6 +1817,16 @@ class TelegramAdapter(BasePlatformAdapter):
         if not query or not query.data:
             return
         data = query.data
+
+        # Laira VC control menu (sidecar)
+        if data.startswith("lvc:"):
+            try:
+                from gateway.platforms.telegram_laira_vc_menu import try_handle_callback
+                if await try_handle_callback(query, context):
+                    return
+            except Exception:
+                logger.exception("laira-vc menu callback handler crashed")
+
         query_message = getattr(query, "message", None)
         query_chat_id = getattr(query_message, "chat_id", None)
         query_chat = getattr(query_message, "chat", None)
@@ -2827,6 +2837,16 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not update.message or not update.message.text:
             return
+
+        # Laira VC menu — consume pending input (channel id / steer text) before
+        # the agent sees it. No-op if the user has nothing pending.
+        try:
+            from gateway.platforms.telegram_laira_vc_menu import try_handle_pending_input
+            if await try_handle_pending_input(update, context):
+                return
+        except Exception:
+            logger.exception("laira-vc menu pending-input handler crashed")
+
         if not self._should_process_message(update.message):
             return
 
@@ -2838,6 +2858,15 @@ class TelegramAdapter(BasePlatformAdapter):
         """Handle incoming command messages."""
         if not update.message or not update.message.text:
             return
+
+        # Laira VC control menu (sidecar) — intercept /lvc before the agent sees it
+        try:
+            from gateway.platforms.telegram_laira_vc_menu import try_handle_command
+            if await try_handle_command(update, context):
+                return
+        except Exception:
+            logger.exception("laira-vc menu command handler crashed")
+
         if not self._should_process_message(update.message, is_command=True):
             return
         
