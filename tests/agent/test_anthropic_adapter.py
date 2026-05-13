@@ -570,6 +570,59 @@ class TestConvertTools:
         }
         assert result[0]["input_schema"]["required"] == ["command"]
 
+    def test_strips_top_level_anyof_from_input_schema(self):
+        # Regression for upstream cherry-pick a219a0a4d: Anthropic's validator
+        # returns HTTP 400 if the tool input_schema has a top-level oneOf /
+        # allOf / anyOf (common when a Pydantic discriminated union is
+        # exposed as a tool argument). _normalize_tool_input_schema must
+        # strip those keys before the schema reaches the API.
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "select_widget",
+                    "description": "Pick a widget by discriminator",
+                    "parameters": {
+                        "anyOf": [
+                            {"type": "object", "properties": {"kind": {"const": "a"}}},
+                            {"type": "object", "properties": {"kind": {"const": "b"}}},
+                        ],
+                    },
+                },
+            }
+        ]
+
+        result = convert_tools_to_anthropic(tools)
+
+        schema = result[0]["input_schema"]
+        assert "anyOf" not in schema
+        assert "oneOf" not in schema
+        assert "allOf" not in schema
+        # The fallback shape must still be a valid object schema so the API
+        # call doesn't 400 on the *replacement* either.
+        assert schema["type"] == "object"
+        assert isinstance(schema.get("properties"), dict)
+
+    def test_strips_top_level_oneof_and_allof_from_input_schema(self):
+        # Same upstream fix, covering the other two banned keywords.
+        for banned_key in ("oneOf", "allOf"):
+            tools = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "tool",
+                        "description": "test",
+                        "parameters": {
+                            banned_key: [{"type": "object"}, {"type": "object"}],
+                        },
+                    },
+                }
+            ]
+            result = convert_tools_to_anthropic(tools)
+            schema = result[0]["input_schema"]
+            assert banned_key not in schema, f"{banned_key} not stripped"
+            assert schema["type"] == "object"
+
 
 # ---------------------------------------------------------------------------
 # Message conversion
