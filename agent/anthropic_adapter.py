@@ -263,23 +263,73 @@ _CONTEXT_1M_BETA = "context-1m-2025-08-07"
 _FAST_MODE_BETA = "fast-mode-2026-02-01"
 
 # Additional beta headers required for OAuth/subscription auth.
-# Matches what Claude Code (and pi-ai / OpenCode) send. Sniffed from real
-# Claude Code 2.1.92 traffic — see hermes/skills/openclaw-imports/
-# openclaw-oauth-max-patch/SKILL.md for the source of truth.
-_OAUTH_ONLY_BETAS = [
-    "claude-code-20250219",
+# Sniffed from real Claude Code 2.1.138 wire traffic (May 10 2026 mitm capture
+# at /home/node/anthropic-fingerprint-2.1.138.json on Laira).
+#
+# Anthropic now sends DIFFERENT beta sets per model on the OAuth route:
+#   Opus 4.7   → claude-code, oauth, interleaved-thinking, context-management,
+#                prompt-caching-scope, advisor-tool, advanced-tool-use,
+#                effort, extended-cache-ttl
+#   Sonnet 4.5 → same as Opus minus `effort`
+#   Haiku 4.5  → oauth, interleaved-thinking, context-management,
+#                prompt-caching-scope, advisor-tool, structured-outputs
+#                (no claude-code, no advanced-tool-use, no extended-cache-ttl)
+#
+# We resolve the per-request set from the model name in
+# ``_oauth_betas_for_model``.  The constants below are the building blocks.
+_OAUTH_BETA_BASE = [
     "oauth-2025-04-20",
+    "interleaved-thinking-2025-05-14",
     "context-management-2025-06-27",
     "prompt-caching-scope-2026-01-05",
+    "advisor-tool-2026-03-01",
+]
+_OAUTH_BETA_NON_HAIKU = [
+    "claude-code-20250219",
     "advanced-tool-use-2025-11-20",
+    "extended-cache-ttl-2025-04-11",
+]
+_OAUTH_BETA_OPUS_ONLY = [
     "effort-2025-11-24",
 ]
+_OAUTH_BETA_HAIKU_ONLY = [
+    "structured-outputs-2025-12-15",
+]
+
+
+def _oauth_betas_for_model(model: str) -> list:
+    """Return the OAuth beta header list Claude Code 2.1.138 sends for ``model``.
+
+    The set is per-model, not static: Haiku ships a leaner list than Opus/Sonnet,
+    and only Opus carries the ``effort`` beta. Drift here triggers Anthropic's
+    OAuth third-party classifier and degrades to ``You're out of extra usage``
+    400s even on healthy quota.
+    """
+    m = (model or "").lower()
+    is_haiku = "haiku" in m
+    is_opus = "opus" in m
+    if is_haiku:
+        return list(_OAUTH_BETA_BASE) + list(_OAUTH_BETA_HAIKU_ONLY)
+    betas = list(_OAUTH_BETA_BASE) + list(_OAUTH_BETA_NON_HAIKU)
+    if is_opus:
+        betas += list(_OAUTH_BETA_OPUS_ONLY)
+    return betas
+
+
+# Legacy alias kept for callers that still want a "kitchen sink" list when the
+# model is unknown.  Prefer ``_oauth_betas_for_model`` whenever you have the
+# model string available.
+_OAUTH_ONLY_BETAS = (
+    _OAUTH_BETA_BASE
+    + _OAUTH_BETA_NON_HAIKU
+    + _OAUTH_BETA_OPUS_ONLY
+)
 
 # Claude Code identity — required for OAuth requests to be routed correctly.
 # Without these, Anthropic's infrastructure intermittently 500s OAuth traffic.
 # The version must stay reasonably current — Anthropic rejects OAuth requests
 # when the spoofed user-agent version is too far behind the actual release.
-_CLAUDE_CODE_VERSION_FALLBACK = "2.1.74"
+_CLAUDE_CODE_VERSION_FALLBACK = "2.1.138"
 _claude_code_version_cache: Optional[str] = None
 
 
@@ -725,9 +775,23 @@ def build_anthropic_client(
         # query; without the full Claude Code fingerprint the OAuth classifier
         # rejects with a misleading 400 "You're out of extra usage." even
         # when the subscription has ample quota. The exact recipe below is
-        # sniffed from Claude Code 2.1.92 — see
-        # hermes/skills/openclaw-imports/openclaw-oauth-max-patch/SKILL.md.
-        all_betas = common_betas + _OAUTH_ONLY_BETAS
+        # sniffed from Claude Code 2.1.138 (May 10 2026 mitm capture) — see
+        # hermes/skills/openclaw-imports/openclaw-oauth-max-patch/SKILL.md
+        # for the source of truth and historical drift notes.
+        #
+        # NOTE: betas here are model-agnostic at client-construction time
+        # (we don't yet know which model the next call will use). The actual
+        # request-level betas are set per-call via ``_oauth_betas_for_model``
+        # in ``extra_headers``; this list is the fallback for callers that
+        # bypass extra_headers entirely. Real Claude Code does NOT ship
+        # _COMMON_BETAS on OAuth traffic, so we keep this fallback aligned —
+        # OAuth-only beta set, deduped, no common betas.
+        seen = set()
+        all_betas = []
+        for b in _OAUTH_ONLY_BETAS:
+            if b not in seen:
+                seen.add(b)
+                all_betas.append(b)
         kwargs["auth_token"] = api_key
         # ``?beta=true`` query parameter on the URL is required, per the
         # sniff: not just the beta headers.
@@ -740,13 +804,21 @@ def build_anthropic_client(
         # classifier sees a non-Claude-Code fingerprint. Matching the SDK
         # case overrides cleanly. Suffix is ``(external, sdk-cli)`` per the
         # sniff — not ``(external, cli)``.
+        #
+        # 2026-05-10 wire-format update (Claude Code 2.1.138):
+        #   • DROPPED: ``x-service-name``, ``anthropic-client-platform``
+        #     (no longer present in real CC traffic; safe to omit and keeps
+        #     us closer to the official fingerprint)
+        #   • ADDED:   ``anthropic-version: 2023-06-01`` (always sent by the
+        #     official client, was previously implicit through the SDK)
+        #   • ADDED:   ``x-client-request-id`` (fresh uuid4 per request — the
+        #     official client uses it for client-side trace correlation)
         cc_session_id = _get_claude_code_session_id()
         kwargs["default_headers"] = {
             "anthropic-beta": ",".join(all_betas),
+            "anthropic-version": "2023-06-01",
             "User-Agent": f"claude-cli/{_get_claude_code_version()} (external, sdk-cli)",
             "x-app": "cli",
-            "x-service-name": "claude-code",
-            "anthropic-client-platform": "cli",
             "anthropic-dangerous-direct-browser-access": "true",
             "X-Claude-Code-Session-Id": cc_session_id,
         }
@@ -975,16 +1047,21 @@ def _build_cc_billing_block() -> Dict[str, str]:
     This is the FIRST text block in the system field on real Claude Code
     requests; it's what routes OAuth traffic through the Max subscription
     billing pool. cc_version is the running Claude Code version,
-    cc_entrypoint is ``sdk-cli`` for SDK-mode traffic, and cch is a short
-    placeholder identifier (Claude Code itself uses small hex values).
+    cc_entrypoint is ``sdk-cli`` for SDK-mode traffic, and ``cch`` is a
+    short hex identifier (Claude Code 2.1.138 emits a fresh 5-char value
+    per request — observed differing across two identical-prompt
+    invocations in May 10 2026 mitm capture, so the server is
+    format-validated, not content-validated).
     """
+    import secrets
+
     return {
         "type": "text",
         "text": (
             f"x-anthropic-billing-header: "
             f"cc_version={_get_claude_code_version()}; "
             f"cc_entrypoint=sdk-cli; "
-            f"cch=00000;"
+            f"cch={secrets.token_hex(3)[:5]};"
         ),
     }
 
@@ -2298,6 +2375,23 @@ def build_anthropic_kwargs(
                 kwargs["temperature"] = 1
                 kwargs["max_tokens"] = max(effective_max_tokens, budget + 4096)
 
+            # Real Claude Code 2.1.138 attaches a context_management
+            # ``clear_thinking`` edit on EVERY thinking-enabled request
+            # (adaptive OR manual). Sniffed from May 10 2026 mitm capture —
+            # Opus 4.7 (adaptive) and Sonnet 4.5 (manual) both ship it.
+            # Haiku doesn't because Haiku doesn't take thinking at all.
+            # Mirroring the wire format keeps us aligned with the official
+            # client and avoids the OAuth third-party classifier.
+            # The Anthropic Python SDK version bundled here does not expose
+            # context_management as a typed Messages.create kwarg yet.  Ship it
+            # through extra_body so it still lands as a top-level JSON body
+            # field on the wire without raising TypeError locally.
+            kwargs.setdefault("extra_body", {})["context_management"] = {
+                "edits": [
+                    {"type": "clear_thinking_20251015", "keep": "all"},
+                ],
+            }
+
     # ── Strip sampling params on 4.7+ ─────────────────────────────────
     # Opus 4.7 rejects any non-default temperature/top_p/top_k with a 400.
     # Callers (auxiliary_client, etc.) may set these for older models;
@@ -2326,9 +2420,50 @@ def build_anthropic_kwargs(
             drop_context_1m_beta=drop_context_1m_beta,
         ))
         if is_oauth:
-            betas.extend(_OAUTH_ONLY_BETAS)
+            # Use per-model OAuth betas (matches Claude Code 2.1.138 wire
+            # format) instead of the kitchen-sink legacy list.
+            betas.extend(_oauth_betas_for_model(model))
         betas.append(_FAST_MODE_BETA)
         kwargs["extra_headers"] = {"anthropic-beta": ",".join(betas)}
+
+    # ── OAuth: per-request fingerprint headers ──────────────────────
+    # Real Claude Code 2.1.138 sends per-call dynamic headers we can't bake
+    # into the client's default_headers (because they vary per request):
+    #   • anthropic-beta : per-model (Opus/Sonnet/Haiku ship different sets)
+    #   • x-client-request-id : fresh uuid4 per request for trace correlation
+    #
+    # CRITICAL: on the OAuth path we replace the common-betas entirely with
+    # the per-model OAuth-only set.  Real Claude Code does NOT ship
+    # ``fine-grained-tool-streaming`` or ``context-1m`` on OAuth traffic, and
+    # carrying betas the official client doesn't carry is a strong
+    # third-party-classifier signal.  Match the wire format exactly.
+    #
+    # Skip on third-party endpoints (Bedrock, MiniMax, Kimi, etc.) that
+    # wouldn't recognize Claude Code identity.
+    if is_oauth and not _is_third_party_anthropic_endpoint(base_url):
+        import uuid as _uuid
+
+        # Per-model OAuth-only betas — DOES NOT include _COMMON_BETAS by
+        # design, since real Claude Code 2.1.138 doesn't send those on the
+        # OAuth route.
+        per_call_betas = list(_oauth_betas_for_model(model))
+        # Preserve fast-mode beta if the previous fast-mode block added it.
+        existing = kwargs.get("extra_headers") or {}
+        existing_beta = existing.get("anthropic-beta", "")
+        if _FAST_MODE_BETA in existing_beta and _FAST_MODE_BETA not in per_call_betas:
+            per_call_betas.append(_FAST_MODE_BETA)
+        # Dedupe while preserving order.
+        seen = set()
+        ordered_betas = []
+        for b in per_call_betas:
+            if b not in seen:
+                seen.add(b)
+                ordered_betas.append(b)
+        kwargs["extra_headers"] = {
+            **existing,
+            "anthropic-beta": ",".join(ordered_betas),
+            "x-client-request-id": str(_uuid.uuid4()),
+        }
 
     # TEMP DEBUG: dump full kwargs once for the OAuth path so we can replay
     # the exact production payload offline. Safe to remove once root cause
