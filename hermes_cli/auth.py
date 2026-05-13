@@ -816,8 +816,47 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
         return {"version": AUTH_STORE_VERSION, "providers": {}}
 
     try:
-        raw = json.loads(auth_file.read_text())
-    except Exception as exc:
+        raw_text = auth_file.read_text()
+    except PermissionError as exc:
+        # Filesystem ownership bug, not a corrupt file. Returning an empty
+        # store here would cause _save_auth_store on the next write to
+        # overwrite the live credentials with an empty pool -- which is
+        # exactly the silent-wipe incident on 2026-05-13 (root-owned
+        # auth.json after a debugging `docker exec`). Raise loudly instead.
+        import sys as _sys
+        msg = (
+            f"auth: PermissionError reading {auth_file} ({exc}). "
+            f"File ownership likely wrong (process euid={os.geteuid()}). "
+            "Refusing to silently empty credential pool. "
+            "Fix: chown the file to the user Hermes runs as, then retry."
+        )
+        logger.error(msg)
+        try:
+            _sys.stderr.write(msg + "\n")
+            _sys.stderr.flush()
+        except Exception:
+            pass
+        raise
+    except (OSError, UnicodeDecodeError) as exc:
+        # Non-permission I/O failure (e.g. EIO, decode error on a binary
+        # garbage file). Treat as corruption: preserve and start fresh.
+        corrupt_path = auth_file.with_suffix(".json.corrupt")
+        try:
+            import shutil
+            shutil.copy2(auth_file, corrupt_path)
+        except Exception:
+            pass
+        logger.error(
+            "auth: I/O failure reading %s (%s) — preserving as %s, starting empty.",
+            auth_file, exc, corrupt_path,
+        )
+        return {"version": AUTH_STORE_VERSION, "providers": {}}
+
+    try:
+        raw = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        # Genuine JSON corruption. Safe to fall back to empty store -- the
+        # bad bytes are preserved at .json.corrupt for forensics.
         corrupt_path = auth_file.with_suffix(".json.corrupt")
         try:
             import shutil
