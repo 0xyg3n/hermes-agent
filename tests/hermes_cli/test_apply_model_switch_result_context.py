@@ -2,12 +2,10 @@
 
 Bug (April 2026): after choosing a model from the interactive `/model` picker,
 ``HermesCLI._apply_model_switch_result()`` printed ``ModelInfo.context_window``
-straight from models.dev, which always reports the vendor-wide value (e.g.
-gpt-5.5 = 1,050,000 on ``openai``). That ignored provider-specific caps — in
-particular, ChatGPT Codex OAuth enforces 272K on the same slug. The sibling
-``_handle_model_switch()`` (typed ``/model <name>``) was already fixed to use
-``resolve_display_context_length()``; the picker path was missed, causing
-"sometimes 1M, sometimes 272K" for the same model across sibling UI paths.
+straight from models.dev. That ignored provider-specific context metadata. The
+sibling ``_handle_model_switch()`` (typed ``/model <name>``) was already fixed
+to use ``resolve_display_context_length()``; the picker path was missed, causing
+inconsistent context display for the same model across sibling UI paths.
 
 Fix: both display paths now go through ``resolve_display_context_length()``.
 """
@@ -56,7 +54,7 @@ def _run_display(monkeypatch, result):
 
 def test_picker_path_uses_provider_aware_context_on_codex(monkeypatch):
     """``_apply_model_switch_result`` must prefer the provider-aware resolver
-    (272K on Codex) over the raw models.dev value (1.05M for gpt-5.5).
+    over stale or under-reported model catalog values.
     """
     result = ModelSwitchResult(
         success=True,
@@ -70,21 +68,18 @@ def test_picker_path_uses_provider_aware_context_on_codex(monkeypatch):
         provider_label="ChatGPT Codex",
         resolved_via_alias=False,
         capabilities=None,
-        model_info=_FakeModelInfo(),  # models.dev says 1.05M
+        model_info=_FakeModelInfo(),
         is_global=False,
     )
     with patch(
         "agent.model_metadata.get_model_context_length",
-        return_value=272_000,
+        return_value=1_050_000,
     ):
         lines = _run_display(monkeypatch, result)
 
     ctx_line = next((l for l in lines if "Context:" in l), "")
-    assert "272,000" in ctx_line, (
-        f"picker-path display must show Codex's 272K cap, got: {ctx_line!r}"
-    )
-    assert "1,050,000" not in ctx_line, (
-        f"picker-path display leaked models.dev's 1.05M for Codex: {ctx_line!r}"
+    assert "1,050,000" in ctx_line, (
+        f"picker-path display must show Codex gpt-5.5's 1.05M context, got: {ctx_line!r}"
     )
 
 

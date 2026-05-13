@@ -1083,21 +1083,24 @@ def _query_anthropic_context_length(model: str, base_url: str, api_key: str) -> 
     return None
 
 
-# Known ChatGPT Codex OAuth context windows (observed via live
-# chatgpt.com/backend-api/codex/models probe, Apr 2026). These are the
-# `context_window` values, which are what Codex actually enforces — the
-# direct OpenAI API has larger limits for the same slugs, but Codex OAuth
-# caps lower (e.g. gpt-5.5 is 1.05M on the API, 272K on Codex).
+# Known ChatGPT Codex OAuth context windows. Most Codex OAuth slugs report
+# lower `context_window` values from chatgpt.com/backend-api/codex/models than
+# the direct OpenAI API, but GPT-5.5 supports the full 1.05M window on OAuth too.
 #
-# Used as a fallback when the live probe fails (no token, network error).
-# Longest keys first so substring match picks the most specific entry.
+# `_CODEX_OAUTH_CONTEXT_OVERRIDES` is authoritative and wins over both stale
+# cache entries and the live Codex /models response. `_CODEX_OAUTH_CONTEXT_FALLBACK`
+# is used only when there is no explicit override and the live probe fails.
+_CODEX_OAUTH_CONTEXT_OVERRIDES: Dict[str, int] = {
+    "gpt-5.5": 1_050_000,
+}
+
 _CODEX_OAUTH_CONTEXT_FALLBACK: Dict[str, int] = {
     "gpt-5.1-codex-max": 272_000,
     "gpt-5.1-codex-mini": 272_000,
     "gpt-5.3-codex": 272_000,
     "gpt-5.2-codex": 272_000,
     "gpt-5.4-mini": 272_000,
-    "gpt-5.5": 272_000,
+    "gpt-5.5": 1_050_000,
     "gpt-5.4": 272_000,
     "gpt-5.2": 272_000,
     "gpt-5": 272_000,
@@ -1112,9 +1115,9 @@ _CODEX_OAUTH_CONTEXT_CACHE_TTL = 3600  # 1 hour
 def _fetch_codex_oauth_context_lengths(access_token: str) -> Dict[str, int]:
     """Probe the ChatGPT Codex /models endpoint for per-slug context windows.
 
-    Codex OAuth imposes its own context limits that differ from the direct
-    OpenAI API (e.g. gpt-5.5 is 1.05M on the API, 272K on Codex). The
-    `context_window` field in each model entry is the authoritative source.
+    Codex OAuth imposes its own context limits that can differ from the direct
+    OpenAI API. The `context_window` field in each model entry is normally
+    authoritative, except for slugs listed in `_CODEX_OAUTH_CONTEXT_OVERRIDES`.
 
     Returns a ``{slug: context_window}`` dict. Empty on failure.
     """
@@ -1165,12 +1168,17 @@ def _resolve_codex_oauth_context_length(
 ) -> Optional[int]:
     """Resolve a Codex OAuth model's real context window.
 
-    Prefers a live probe of chatgpt.com/backend-api/codex/models (when we
-    have a bearer token), then falls back to ``_CODEX_OAUTH_CONTEXT_FALLBACK``.
+    Explicit overrides win first, then a live probe of
+    chatgpt.com/backend-api/codex/models (when we have a bearer token), then
+    ``_CODEX_OAUTH_CONTEXT_FALLBACK``.
     """
     model_bare = _strip_provider_prefix(model).strip()
     if not model_bare:
         return None
+
+    override = _CODEX_OAUTH_CONTEXT_OVERRIDES.get(model_bare.lower())
+    if override:
+        return override
 
     if access_token:
         live = _fetch_codex_oauth_context_lengths(access_token)
@@ -1275,6 +1283,16 @@ def get_model_context_length(
     # local servers actually know about.  Ollama "model:tag" colons are preserved.
     model = _strip_provider_prefix(model)
 
+    if provider == "openai-codex":
+        codex_override = _CODEX_OAUTH_CONTEXT_OVERRIDES.get(model.strip().lower())
+        if codex_override:
+            if base_url:
+                cached = get_cached_context_length(model, base_url)
+                if cached != codex_override:
+                    _invalidate_cached_context_length(model, base_url)
+                    save_context_length(model, base_url, codex_override)
+            return codex_override
+
     # 1. Check persistent cache (model+provider)
     # LM Studio is excluded — its loaded context length is transient (the
     # user can reload the model with a different context_length at any time
@@ -1283,11 +1301,12 @@ def get_model_context_length(
         cached = get_cached_context_length(model, base_url)
         if cached is not None:
             # Invalidate stale Codex OAuth cache entries: pre-PR #14935 builds
-            # resolved gpt-5.x to the direct-API value (e.g. 1.05M) via
-            # models.dev and persisted it. Codex OAuth caps at 272K for every
-            # slug, so any cached Codex entry at or above 400K is a leftover
-            # from the old resolution path. Drop it and fall through to the
-            # live /models probe in step 5 below.
+            # resolved most gpt-5.x slugs to the direct-API value (e.g. 1.05M)
+            # via models.dev and persisted it. Except for explicit overrides
+            # handled above, Codex OAuth still caps these slugs lower, so any
+            # cached Codex entry at or above 400K is a leftover from the old
+            # resolution path. Drop it and fall through to the live /models
+            # probe in step 5 below.
             if provider == "openai-codex" and cached >= 400_000:
                 logger.info(
                     "Dropping stale Codex cache entry %s@%s -> %s (pre-fix value); "
