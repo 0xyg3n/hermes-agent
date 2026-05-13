@@ -113,6 +113,10 @@ COMMAND_REGISTRY: list[CommandDef] = [
                aliases=("gpt",)),
     CommandDef("anthropic", "Switch auth/model to Anthropic Opus with GPT fallback", "Configuration",
                ),
+    CommandDef("cred", "Pin a specific credential pool entry to this chat (Giannis only)",
+               "Configuration", gateway_only=True,
+               args_hint="[list|show|<label>|reset] [--global]",
+               subcommands=("list", "show", "reset")),
     CommandDef("gquota", "Show Google Gemini Code Assist quota usage", "Info",
                cli_only=True),
 

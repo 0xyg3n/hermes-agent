@@ -2530,6 +2530,35 @@ class DiscordAdapter(BasePlatformAdapter):
         async def slash_stop(interaction: discord.Interaction):
             await self._run_simple_slash(interaction, "/stop", "Stop requested~")
 
+        @tree.command(name="cred", description="Pin a credential pool entry to this chat (Giannis only)")
+        async def slash_cred(interaction: discord.Interaction):
+            from gateway.cred_menu import is_owner, build_menu_payload
+            user_id = str(getattr(interaction.user, "id", "") or "")
+            if not is_owner("discord", user_id):
+                try:
+                    await interaction.response.send_message(
+                        "🔒 /cred is restricted to Giannis.",
+                        ephemeral=True,
+                    )
+                except Exception:
+                    pass
+                return
+            chat_id = str(getattr(interaction, "channel_id", "") or "")
+            text, rows, _ = build_menu_payload(
+                platform="discord", chat_id=chat_id, global_scope=False,
+            )
+            try:
+                view = self._build_discord_cred_view(rows)
+            except Exception:
+                view = None
+            try:
+                if view is None:
+                    await interaction.response.send_message(text, ephemeral=True)
+                else:
+                    await interaction.response.send_message(text, view=view, ephemeral=True)
+            except Exception as exc:
+                logger.warning("[Discord] /cred render failed: %s", exc)
+
         @tree.command(name="steer", description="Inject a message after the next tool call (no interrupt)")
         @discord.app_commands.describe(prompt="Text to inject into the agent's next tool result")
         async def slash_steer(interaction: discord.Interaction, prompt: str):
@@ -4254,6 +4283,75 @@ if DISCORD_AVAILABLE:
             self.resolved = True
             for child in self.children:
                 child.disabled = True
+
+    class CredPickerView(discord.ui.View):
+        """Discord ephemeral credential-pool picker (Giannis only)."""
+
+        def __init__(self, adapter, rows):
+            super().__init__(timeout=300)
+            self.adapter = adapter
+            self._rebuild(rows)
+
+        def _rebuild(self, rows):
+            self.clear_items()
+            for r, row in enumerate(rows):
+                for col, (text, cb) in enumerate(row):
+                    style = discord.ButtonStyle.primary
+                    if cb.startswith("cred:reset"):
+                        style = discord.ButtonStyle.danger
+                    elif cb.startswith("cred:scope") or cb.startswith("cred:refresh"):
+                        style = discord.ButtonStyle.secondary
+                    btn = discord.ui.Button(
+                        label=text[:80],
+                        style=style,
+                        custom_id=cb[:100],
+                        row=min(r, 4),
+                    )
+                    btn.callback = self._make_handler(cb)
+                    try:
+                        self.add_item(btn)
+                    except Exception:
+                        return
+
+        def _make_handler(self, cb_data: str):
+            adapter = self.adapter
+
+            async def _on_click(interaction: discord.Interaction):
+                from gateway.cred_menu import is_owner, apply_callback, build_menu_payload
+                uid = str(getattr(interaction.user, "id", "") or "")
+                if not is_owner("discord", uid):
+                    try:
+                        await interaction.response.send_message(
+                            "🔒 not for you", ephemeral=True,
+                        )
+                    except Exception:
+                        pass
+                    return
+                chat_id = str(getattr(interaction, "channel_id", "") or "")
+                toast, global_after, ok = apply_callback(
+                    payload=cb_data, platform="discord", chat_id=chat_id,
+                )
+                text, rows, _ = build_menu_payload(
+                    platform="discord", chat_id=chat_id, global_scope=global_after,
+                )
+                self._rebuild(rows)
+                try:
+                    await interaction.response.edit_message(content=f"{text}\n\n_{toast}_", view=self)
+                except Exception:
+                    try:
+                        await interaction.followup.edit_message(
+                            interaction.message.id,
+                            content=f"{text}\n\n_{toast}_",
+                            view=self,
+                        )
+                    except Exception:
+                        pass
+
+            return _on_click
+
+    def _build_discord_cred_view(self, rows):
+        """Return a fresh CredPickerView for the supplied row layout."""
+        return self.CredPickerView(self, rows)
 
     class ModelPickerView(discord.ui.View):
         """Interactive select-menu view for model switching.

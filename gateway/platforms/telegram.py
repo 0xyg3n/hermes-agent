@@ -1827,6 +1827,15 @@ class TelegramAdapter(BasePlatformAdapter):
             except Exception:
                 logger.exception("laira-vc menu callback handler crashed")
 
+        # Credential picker menu (sidecar)
+        if data.startswith("cred:"):
+            try:
+                from gateway.platforms.telegram_cred_menu import try_handle_callback as _cred_cb
+                if await _cred_cb(query, context):
+                    return
+            except Exception:
+                logger.exception("cred menu callback handler crashed")
+
         query_message = getattr(query, "message", None)
         query_chat_id = getattr(query_message, "chat_id", None)
         query_chat = getattr(query_message, "chat", None)
@@ -2866,6 +2875,14 @@ class TelegramAdapter(BasePlatformAdapter):
                 return
         except Exception:
             logger.exception("laira-vc menu command handler crashed")
+
+        # Credential picker menu (sidecar) — intercept /cred before the agent sees it
+        try:
+            from gateway.platforms.telegram_cred_menu import try_handle_command as _cred_try
+            if await _cred_try(update, context):
+                return
+        except Exception:
+            logger.exception("cred menu command handler crashed")
 
         if not self._should_process_message(update.message, is_command=True):
             return

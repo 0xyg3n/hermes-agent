@@ -1347,13 +1347,18 @@ class GatewayRunner:
 
         return model, runtime_kwargs
 
-    def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
+    def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict, *, source: Optional[Any] = None) -> dict:
         """Build the effective model/runtime config for a single turn.
 
         Always uses the session's primary model/provider.  If `/fast` is
         enabled and the model supports Priority Processing / Anthropic fast
         mode, attach `request_overrides` so the API call is marked
         accordingly.
+
+        When ``source`` is supplied (real inbound platform message) and a
+        per-chat credential pin exists for the resolved provider, swap
+        the runtime ``api_key``/``base_url`` to the pinned pool entry's
+        credentials.  This is what powers the ``/cred`` slash command.
         """
         from hermes_cli.models import resolve_fast_mode_overrides
 
@@ -1366,9 +1371,53 @@ class GatewayRunner:
             "args": list(runtime_kwargs.get("args") or []),
             "credential_pool": runtime_kwargs.get("credential_pool"),
         }
+
+        # ── Per-chat credential pin override ─────────────────────────────
+        # If the user pinned a specific pool label for this chat (or
+        # globally), look it up in the live pool and override the runtime
+        # creds.  Failure modes (pool missing, label unknown, entry has
+        # no usable token) silently fall back to the strategy selection
+        # so a stale pin never wedges a conversation.
+        pin_label: Optional[str] = None
+        try:
+            from agent.credential_pins import get_pin
+            platform_name = None
+            chat_id = None
+            if source is not None:
+                pf = getattr(source, "platform", None)
+                platform_name = getattr(pf, "value", None) if pf is not None else None
+                chat_id = getattr(source, "chat_id", None)
+            pin_label = get_pin(runtime["provider"] or "", platform_name, chat_id)
+        except Exception:
+            pin_label = None
+
+        applied_pin: Optional[str] = None
+        pool = runtime.get("credential_pool")
+        if pin_label and pool is not None and hasattr(pool, "find_by_label"):
+            try:
+                pinned_entry = pool.find_by_label(pin_label)
+            except Exception:
+                pinned_entry = None
+            if pinned_entry is not None:
+                pinned_key = (
+                    getattr(pinned_entry, "runtime_api_key", None)
+                    or getattr(pinned_entry, "access_token", None)
+                    or ""
+                )
+                pinned_base = (
+                    getattr(pinned_entry, "runtime_base_url", None)
+                    or getattr(pinned_entry, "base_url", None)
+                )
+                if pinned_key:
+                    runtime["api_key"] = pinned_key
+                    if pinned_base:
+                        runtime["base_url"] = pinned_base
+                    applied_pin = pin_label
+
         route = {
             "model": model,
             "runtime": runtime,
+            "credential_pin": applied_pin,
             "signature": (
                 model,
                 runtime["provider"],
@@ -1376,6 +1425,7 @@ class GatewayRunner:
                 runtime["api_mode"],
                 runtime["command"],
                 tuple(runtime["args"]),
+                applied_pin,
             ),
         }
 
@@ -5084,6 +5134,9 @@ class GatewayRunner:
         if canonical in ("openai", "anthropic"):
             return await self._handle_auth_profile_command(event, canonical)
 
+        if canonical == "cred":
+            return await self._handle_cred_command(event)
+
         if canonical == "personality":
             return await self._handle_personality_command(event)
 
@@ -7979,6 +8032,128 @@ class GatewayRunner:
         return (
             f"✅ Home channel set to **{chat_name}** (ID: {chat_id}).\n"
             f"Cron jobs and cross-platform messages will be delivered here."
+        )
+
+    # Hardcoded owner identifiers — only Giannis is allowed to manipulate
+    # the credential pin via /cred from messaging platforms.  Display
+    # names are user-controlled so we ALWAYS check the numeric platform
+    # ID against this allowlist.
+    _CRED_OWNER_IDS = {
+        "telegram": {"413720629"},
+        "discord": {"1085530082803716118"},
+    }
+
+    def _is_credential_command_owner(self, source: Any) -> bool:
+        """Return True only if this message came from Giannis's verified ID."""
+        if source is None:
+            return False
+        platform = getattr(source, "platform", None)
+        platform_name = (getattr(platform, "value", "") or "").lower()
+        user_id = str(getattr(source, "user_id", "") or "").strip()
+        if not platform_name or not user_id:
+            return False
+        return user_id in self._CRED_OWNER_IDS.get(platform_name, set())
+
+    async def _handle_cred_command(self, event: MessageEvent) -> str:
+        """Handle /cred — pin a specific credential pool entry to this chat.
+
+        Owner-gated: only Giannis (Telegram 413720629 / Discord
+        1085530082803716118) can run this command.  Other senders see a
+        terse refusal.
+        """
+        source = event.source
+        if not self._is_credential_command_owner(source):
+            return "🔒 /cred is restricted to Giannis."
+
+        from agent.credential_pool import load_pool
+        from agent import credential_pins
+
+        # Resolve the active provider for this gateway profile.  We pull
+        # the runtime kwargs the same way every inbound message does.
+        try:
+            runtime_kwargs = _resolve_runtime_agent_kwargs()
+        except Exception as exc:
+            return f"⚠️ Could not resolve provider runtime: {exc}"
+        provider = (runtime_kwargs.get("provider") or "").strip().lower()
+        if not provider:
+            return "⚠️ Active provider could not be determined."
+
+        # Load the live pool so we can validate labels and show what's
+        # available.  We deliberately load by provider rather than reuse
+        # ``runtime_kwargs['credential_pool']`` so /cred works even on
+        # gateway boots that didn't seed a pool into runtime (e.g. when
+        # the provider was resolved via env-only without pool seeding).
+        try:
+            pool = load_pool(provider)
+        except Exception as exc:
+            return f"⚠️ Could not load credential pool for {provider}: {exc}"
+
+        platform_name = source.platform.value if source.platform else None
+        chat_id = source.chat_id
+
+        raw_args = event.get_command_args() if hasattr(event, "get_command_args") else ""
+        args = (raw_args or "").strip().split()
+        is_global = False
+        if "--global" in args:
+            is_global = True
+            args = [a for a in args if a != "--global"]
+        sub = args[0].lower() if args else "show"
+
+        scope_label = "global" if is_global else f"{platform_name}:{chat_id}" if platform_name else "(unknown chat)"
+        scope_platform = None if is_global else platform_name
+        scope_chat = None if is_global else chat_id
+
+        # /cred list — show available pool entries
+        if sub == "list":
+            entries = pool.entries() if hasattr(pool, "entries") else []
+            if not entries:
+                return f"No credential pool entries for `{provider}`."
+            lines = [f"📋 Credential pool for `{provider}` ({len(entries)} entries):"]
+            for entry in entries:
+                label = getattr(entry, "label", "") or "(no label)"
+                eid = getattr(entry, "id", "")
+                pri = getattr(entry, "priority", "?")
+                status = getattr(entry, "last_status", None) or "ok"
+                lines.append(f"  • `{label}` — id={eid} priority={pri} status={status}")
+            current_pin = credential_pins.get_pin(provider, scope_platform, scope_chat)
+            if current_pin:
+                lines.append(f"\nActive pin for {scope_label}: `{current_pin}`")
+            else:
+                lines.append(f"\nNo pin set for {scope_label} — strategy selects automatically.")
+            return "\n".join(lines)
+
+        # /cred show — display only the active pin for this scope
+        if sub == "show":
+            current_pin = credential_pins.get_pin(provider, scope_platform, scope_chat)
+            if not current_pin:
+                return (
+                    f"No credential pin set for {scope_label}.\n"
+                    f"Use `/cred <label>` to pin one. `/cred list` shows available labels."
+                )
+            return f"📌 Pinned credential for {scope_label}: `{current_pin}`"
+
+        # /cred reset — clear the pin
+        if sub == "reset":
+            removed = credential_pins.clear_pin(provider, scope_platform, scope_chat)
+            if removed:
+                return f"✅ Cleared credential pin for {scope_label}. Round-robin / strategy selection resumes."
+            return f"No pin was set for {scope_label}."
+
+        # /cred <label> — set the pin
+        label = sub  # the literal first arg
+        entry = pool.find_by_label(label) if hasattr(pool, "find_by_label") else None
+        if entry is None:
+            available = [getattr(e, "label", "") for e in pool.entries() if getattr(e, "label", "")]
+            return (
+                f"⚠️ Unknown credential label `{label}` for provider `{provider}`.\n"
+                f"Available: {', '.join(available) if available else '(none)'}\n"
+                f"Use `/cred list` to see details."
+            )
+        credential_pins.set_pin(provider, scope_platform, scope_chat, label)
+        return (
+            f"✅ Pinned `{label}` for {scope_label}.\n"
+            f"Subsequent messages in this {'scope' if is_global else 'chat'} will route through that credential.\n"
+            f"Run `/cred reset` to remove. The pin takes effect on the next message."
         )
 
     @staticmethod
@@ -12337,7 +12512,7 @@ class GatewayRunner:
                 except Exception as _e:
                     logger.debug("interim_assistant_callback error: %s", _e)
 
-            turn_route = self._resolve_turn_agent_config(message, model, runtime_kwargs)
+            turn_route = self._resolve_turn_agent_config(message, model, runtime_kwargs, source=source)
 
             # Check agent cache — reuse the AIAgent from the previous message
             # in this session to preserve the frozen system prompt and tool

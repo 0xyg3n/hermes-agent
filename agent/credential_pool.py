@@ -1047,6 +1047,30 @@ class CredentialPool:
             self._persist()
         return count
 
+    def find_by_label(self, label: str) -> Optional[PooledCredential]:
+        """Look up a pool entry by its display label.
+
+        Used by ``/cred`` slash command and ``credential_pool_pins`` so a
+        chat or task can target a specific credential without going
+        through the strategy-based ``select()``. Returns ``None`` if no
+        entry matches; the caller should fall back to the configured
+        selection strategy in that case.
+
+        Lookup is case-insensitive on label; pool entries with no label
+        are skipped.
+        """
+
+        if not label:
+            return None
+        needle = label.strip().lower()
+        if not needle:
+            return None
+        for entry in self._entries:
+            entry_label = (getattr(entry, "label", "") or "").strip().lower()
+            if entry_label == needle:
+                return entry
+        return None
+
     def remove_index(self, index: int) -> Optional[PooledCredential]:
         if index < 1 or index > len(self._entries):
             return None
