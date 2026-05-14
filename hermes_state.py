@@ -524,7 +524,34 @@ class SessionDB:
         user_id: str = None,
         parent_session_id: str = None,
     ) -> str:
-        """Create a new session record. Returns the session_id."""
+        """Create a new session record. Returns the session_id.
+
+        If ``user_id`` is None but ``parent_session_id`` is set, the new
+        row inherits ``user_id`` from the parent. This fixes the long-tail
+        bug where compression-split child sessions (run_agent.py:9063) and
+        /branch forks (gateway/run.py:9485) created child rows with
+        user_id=NULL, breaking every consumer that filters sessions by
+        user (laira-realtime-vc inbox watcher, session_search, etc).
+        Identity is preserved across the parent->child chain by
+        construction, so inheriting is correct.
+        """
+        if user_id is None and parent_session_id:
+            # Inherit user_id from parent. Read under the same lock the
+            # write helper uses, on the same connection — keeps the
+            # WAL semantics consistent and avoids a separate connection
+            # racing the INSERT below.
+            try:
+                with self._lock:
+                    row = self._conn.execute(
+                        "SELECT user_id FROM sessions WHERE id = ?",
+                        (parent_session_id,),
+                    ).fetchone()
+                if row and row[0]:
+                    user_id = row[0]
+            except Exception:
+                # Best-effort: don't block session creation on lookup failure.
+                pass
+
         def _do(conn):
             conn.execute(
                 """INSERT OR IGNORE INTO sessions (id, source, user_id, model, model_config,
