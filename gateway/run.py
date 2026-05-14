@@ -1414,6 +1414,23 @@ class GatewayRunner:
                         runtime["base_url"] = pinned_base
                     applied_pin = pin_label
 
+        # Publish the resolved pin into the turn-scoped contextvar so the
+        # auxiliary-LLM path, credential-pool rotation, and delegated
+        # subagents all stay locked to the same license for this turn —
+        # not just the main agent's runtime above.  We publish ``pin_label``
+        # (the resolved pin) rather than ``applied_pin`` (the override that
+        # actually took): even when the override couldn't apply this instant
+        # (e.g. the pinned entry was momentarily token-less), aux calls and
+        # rotation should still *prefer* that label, and the pool-side
+        # lookup falls back gracefully when the label is missing/exhausted.
+        # The gateway runs each turn inside a copied context
+        # (_run_in_executor_with_context), so this never leaks across turns.
+        try:
+            from agent.credential_pin_context import set_active_pin
+            set_active_pin(runtime["provider"] or "", pin_label or "")
+        except Exception as _pin_exc:  # pragma: no cover - defensive
+            logger.debug("credential pin contextvar publish failed: %s", _pin_exc)
+
         route = {
             "model": model,
             "runtime": runtime,

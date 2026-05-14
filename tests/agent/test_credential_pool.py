@@ -1601,3 +1601,146 @@ def test_codex_exhausted_entry_stays_stuck_without_auth_store_update(tmp_path, m
     # still skips it.
     available = pool._available_entries(clear_expired=True, refresh=False)
     assert available == []
+
+
+# ── Turn-scoped credential pin (/cred slash command) ─────────────────────────
+#
+# Regression coverage for the pin-honoring selection path.  The /cred slash
+# command pins a pool entry by label for a chat scope; the gateway publishes
+# that pin into agent.credential_pin_context at turn start.  select(),
+# acquire_lease(), and (transitively) mark_exhausted_and_rotate() must all
+# prefer the pinned entry — but fall back to strategy when it is exhausted.
+
+
+def _two_entry_pool(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "anthropic": [
+                    {
+                        "id": "cred-1",
+                        "label": "giannis_x20",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "tok-x20",
+                        "last_status": "ok",
+                    },
+                    {
+                        "id": "cred-2",
+                        "label": "vivi_max",
+                        "auth_type": "api_key",
+                        "priority": 1,
+                        "source": "manual",
+                        "access_token": "tok-vivi",
+                        "last_status": "ok",
+                    },
+                ]
+            },
+        },
+    )
+    from agent.credential_pool import load_pool
+
+    return load_pool("anthropic")
+
+
+def test_active_pin_overrides_strategy_in_select(tmp_path, monkeypatch):
+    """A turn-scoped pin must win over the configured selection strategy."""
+    from agent import credential_pin_context as pinctx
+
+    pool = _two_entry_pool(tmp_path, monkeypatch)
+
+    # No pin → strategy default (fill_first) picks priority-0 entry.
+    assert pool.select().label == "giannis_x20"
+
+    # Pin the lower-priority entry → select must snap to it.
+    token = pinctx.set_active_pin("anthropic", "vivi_max")
+    try:
+        entry = pool.select()
+        assert entry is not None
+        assert entry.label == "vivi_max"
+        assert pool.current().label == "vivi_max"
+    finally:
+        pinctx.reset_active_pins(token)
+
+    # Pin cleared → back to strategy default.
+    assert pool.select().label == "giannis_x20"
+
+
+def test_active_pin_falls_back_when_pinned_entry_exhausted(tmp_path, monkeypatch):
+    """A pin pointing at an exhausted entry must not wedge selection."""
+    from agent import credential_pin_context as pinctx
+    from agent.credential_pool import STATUS_EXHAUSTED
+    from dataclasses import replace as dc_replace
+
+    pool = _two_entry_pool(tmp_path, monkeypatch)
+
+    # Exhaust the pinned entry (giannis_x20).
+    target = next(e for e in pool.entries() if e.label == "giannis_x20")
+    exhausted = dc_replace(
+        target,
+        last_status=STATUS_EXHAUSTED,
+        last_status_at=time.time(),
+        last_error_code=429,
+        last_error_reset_at=time.time() + 3600,
+    )
+    pool._replace_entry(target, exhausted)
+    pool._persist()
+
+    token = pinctx.set_active_pin("anthropic", "giannis_x20")
+    try:
+        # Pinned entry is in cooldown → fall back to the only available one.
+        entry = pool.select()
+        assert entry is not None
+        assert entry.label == "vivi_max"
+    finally:
+        pinctx.reset_active_pins(token)
+
+
+def test_active_pin_honored_by_acquire_lease(tmp_path, monkeypatch):
+    """Delegated subagents lease via acquire_lease() — it must honor the pin."""
+    from agent import credential_pin_context as pinctx
+
+    pool = _two_entry_pool(tmp_path, monkeypatch)
+
+    token = pinctx.set_active_pin("anthropic", "vivi_max")
+    try:
+        leased_id = pool.acquire_lease()
+        assert leased_id is not None
+        assert pool.current().label == "vivi_max"
+        pool.release_lease(leased_id)
+    finally:
+        pinctx.reset_active_pins(token)
+
+
+def test_active_pin_unknown_label_falls_back(tmp_path, monkeypatch):
+    """A pin label not present in the pool is treated as no pin."""
+    from agent import credential_pin_context as pinctx
+
+    pool = _two_entry_pool(tmp_path, monkeypatch)
+
+    token = pinctx.set_active_pin("anthropic", "does_not_exist")
+    try:
+        entry = pool.select()
+        assert entry is not None
+        # Strategy default, pin ignored.
+        assert entry.label == "giannis_x20"
+    finally:
+        pinctx.reset_active_pins(token)
+
+
+def test_active_pin_is_provider_scoped(tmp_path, monkeypatch):
+    """A pin for another provider must not affect this provider's selection."""
+    from agent import credential_pin_context as pinctx
+
+    pool = _two_entry_pool(tmp_path, monkeypatch)
+
+    token = pinctx.set_active_pin("openai-codex", "vivi_max")
+    try:
+        # Pin is for a different provider → anthropic pool ignores it.
+        assert pool.select().label == "giannis_x20"
+    finally:
+        pinctx.reset_active_pins(token)

@@ -899,12 +899,61 @@ class CredentialPool:
             self._persist()
         return available
 
+    def _active_pin_label(self) -> Optional[str]:
+        """Return the turn-scoped pinned entry label for this provider.
+
+        Reads the :mod:`agent.credential_pin_context` contextvar published
+        by the gateway at turn start (``/cred`` slash command).  Returns
+        ``None`` when no pin is active or the module is unavailable.  The
+        pin is a *preference*: callers fall back to strategy selection when
+        the pinned entry is missing or in exhaustion cooldown.
+        """
+        try:
+            from agent.credential_pin_context import get_active_pin
+            return get_active_pin(self.provider)
+        except Exception:  # pragma: no cover - defensive
+            return None
+
+    def _pinned_available_entry(
+        self, available: List[PooledCredential]
+    ) -> Optional[PooledCredential]:
+        """Return the pinned entry if it is present in ``available``.
+
+        ``available`` is the list of entries not currently in exhaustion
+        cooldown.  When the pinned label matches one of them, that entry is
+        returned so selection snaps to the pinned license; otherwise
+        ``None`` so the caller falls back to the configured strategy (the
+        pinned entry is exhausted, refreshing, or no longer in the pool).
+        """
+        label = self._active_pin_label()
+        if not label:
+            return None
+        needle = label.strip().lower()
+        if not needle:
+            return None
+        for entry in available:
+            entry_label = (getattr(entry, "label", "") or "").strip().lower()
+            if entry_label == needle:
+                return entry
+        return None
+
     def _select_unlocked(self) -> Optional[PooledCredential]:
         available = self._available_entries(clear_expired=True, refresh=True)
         if not available:
             self._current_id = None
             logger.info("credential pool: no available entries (all exhausted or empty)")
             return None
+
+        # Turn-scoped credential pin takes precedence over the configured
+        # strategy: if the pinned entry is available (not in cooldown), use
+        # it so a pinned chat stays locked to its license across the whole
+        # turn — auxiliary calls, rotation, subagents.  When the pinned
+        # entry is exhausted or missing, fall through to strategy so the
+        # pin can never wedge selection.
+        pinned = self._pinned_available_entry(available)
+        if pinned is not None:
+            self._current_id = pinned.id
+            return pinned
 
         if self._strategy == STRATEGY_RANDOM:
             entry = random.choice(available)
@@ -979,6 +1028,18 @@ class CredentialPool:
             available = self._available_entries(clear_expired=True, refresh=True)
             if not available:
                 return None
+
+            # Honor a turn-scoped credential pin (delegated subagents inherit
+            # the parent's pin via delegate_tool re-installing the contextvar
+            # in the worker thread).  When the pinned entry is available, lease
+            # it directly so the subagent uses the same license as its parent.
+            # Falls through to least-leased selection when the pin is absent
+            # or the pinned entry is in cooldown.
+            pinned = self._pinned_available_entry(available)
+            if pinned is not None:
+                self._active_leases[pinned.id] = self._active_leases.get(pinned.id, 0) + 1
+                self._current_id = pinned.id
+                return pinned.id
 
             below_cap = [
                 entry for entry in available

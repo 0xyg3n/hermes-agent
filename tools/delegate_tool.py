@@ -1074,6 +1074,19 @@ def _build_child_agent(
     if child_pool is not None:
         child._credential_pool = child_pool
 
+    # Capture the parent's turn-scoped credential pin map NOW, on the
+    # parent's context.  delegate_task runs children inside a
+    # ThreadPoolExecutor, and contextvars do NOT propagate to pool worker
+    # threads — so without this snapshot a delegated subagent would ignore
+    # the /cred pin and round-robin off the pinned license.  The snapshot
+    # is re-installed in the worker thread by _run_single_child.
+    try:
+        from agent.credential_pin_context import get_active_pins
+        child._inherited_credential_pins = get_active_pins()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("Could not snapshot credential pins for child: %s", exc)
+        child._inherited_credential_pins = None
+
     # Register child for interrupt propagation
     if hasattr(parent_agent, "_active_children"):
         lock = getattr(parent_agent, "_active_children_lock", None)
@@ -1251,6 +1264,23 @@ def _run_single_child(
     Returns a structured result dict.
     """
     child_start = time.monotonic()
+
+    # Re-install the parent's turn-scoped credential pin map in THIS worker
+    # thread.  delegate_task runs _run_single_child inside a
+    # ThreadPoolExecutor and contextvars do not propagate to pool workers,
+    # so the pin snapshot captured on the parent's context at child-build
+    # time (child._inherited_credential_pins) has to be re-published here.
+    # This makes acquire_lease() below, plus every credential selection /
+    # rotation / auxiliary call inside child.run_conversation, honor the
+    # /cred pin instead of round-robining off the pinned license.
+    _pin_token = None
+    _inherited_pins = getattr(child, "_inherited_credential_pins", None)
+    if _inherited_pins:
+        try:
+            from agent.credential_pin_context import set_active_pins
+            _pin_token = set_active_pins(_inherited_pins)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("Could not re-install inherited credential pins: %s", exc)
 
     # Get the progress callback from the child agent
     child_progress_cb = getattr(child, "tool_progress_callback", None)
@@ -1765,6 +1795,17 @@ def _run_single_child(
         # after the child has finished (or failed).
         _heartbeat_stop.set()
         _heartbeat_thread.join(timeout=5)
+
+        # Reset the turn-scoped credential pin in this worker thread.  Pool
+        # worker threads are recycled across tasks, so leaving a pin
+        # installed would leak into the next unrelated subagent that lands
+        # on the same thread.
+        if _pin_token is not None:
+            try:
+                from agent.credential_pin_context import reset_active_pins
+                reset_active_pins(_pin_token)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug("Failed to reset inherited credential pins: %s", exc)
 
         # Drop the TUI-facing registry entry.  Safe to call even if the
         # child was never registered (e.g. ID missing on test doubles).

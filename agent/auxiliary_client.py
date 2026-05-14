@@ -2749,7 +2749,20 @@ def _client_cache_key(
 ) -> tuple:
     runtime = _normalize_main_runtime(main_runtime)
     runtime_key = tuple(runtime.get(field, "") for field in _MAIN_RUNTIME_FIELDS) if provider == "auto" else ()
-    return (provider, async_mode, base_url or "", api_key or "", api_mode or "", runtime_key, is_vision)
+    # Pool-backed providers resolve their real credential *inside*
+    # resolve_provider_client (via _select_pool_entry), which only runs on
+    # a cache miss.  A turn-scoped /cred pin therefore has to participate
+    # in the cache key — otherwise a cache hit returns a client built with
+    # the previously-pinned (or unpinned) credential and the pin is
+    # silently ignored for auxiliary calls.  Including the pin label here
+    # makes a pin change a natural cache miss → rebuild → honors the pin.
+    pin_key = ""
+    try:
+        from agent.credential_pin_context import get_active_pin
+        pin_key = get_active_pin(provider) or ""
+    except Exception:  # pragma: no cover - defensive
+        pin_key = ""
+    return (provider, async_mode, base_url or "", api_key or "", api_mode or "", runtime_key, is_vision, pin_key)
 
 
 def _store_cached_client(cache_key: tuple, client: Any, default_model: Optional[str], *, bound_loop: Any = None) -> None:
