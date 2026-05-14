@@ -33,6 +33,7 @@ import socket as _socket
 import re
 import sqlite3
 import time
+import urllib.request
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -2697,6 +2698,294 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return response
 
+    # ------------------------------------------------------------------
+    # Realtime relay — inject a synthetic inbound message as if it came
+    # from Giannis on Telegram, routed through the telegram adapter so
+    # the reply lands in his real Telegram DM thread.
+    #
+    # Used by the realtime VC agent (Laira) to talk to the gateway agent
+    # (also Laira) on behalf of Giannis. Auth via HERMES_RELAY_TOKEN
+    # (separate from API_SERVER_KEY so this capability can be scoped
+    # independently).
+    # ------------------------------------------------------------------
+
+    async def _handle_relay_inbound(self, request: "web.Request") -> "web.Response":
+        """POST /v1/relay/inbound — inject a synthetic inbound user message.
+
+        Body: {"text": "...", "platform"?: "telegram"|"discord", "speak"?: bool}
+        Auth: Bearer <HERMES_RELAY_TOKEN>
+
+        Default platform=telegram (backward compat). Target is hard-coded
+        to Giannis on the selected platform (Telegram user_id=413720629 or
+        Discord user_id=1085530082803716118). Text is auto-prefixed
+        "Realtime-Laira-Relay: " so the gateway agent can distinguish
+        relay turns from real typing.
+        """
+        # Dedicated relay token. Falls back to API_SERVER_KEY if unset, so
+        # an operator can keep the same token if they want.
+        relay_token = os.getenv("HERMES_RELAY_TOKEN", "").strip() or self._api_key
+        if not relay_token:
+            return web.json_response(
+                {"error": {"message": "Relay disabled: HERMES_RELAY_TOKEN not configured",
+                           "type": "invalid_request_error", "code": "relay_disabled"}},
+                status=503,
+            )
+
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            return web.json_response(
+                {"error": {"message": "Missing Bearer token", "type": "invalid_request_error", "code": "invalid_api_key"}},
+                status=401,
+            )
+        if not hmac.compare_digest(auth_header[7:].strip(), relay_token):
+            return web.json_response(
+                {"error": {"message": "Invalid relay token", "type": "invalid_request_error", "code": "invalid_api_key"}},
+                status=401,
+            )
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        text = str(body.get("text") or "").strip()
+        if not text:
+            return web.json_response(_openai_error("Missing 'text' field"), status=400)
+        # Cap relay payload (matches send_telegram cap upstream)
+        if len(text) > 3500:
+            text = text[:3500]
+
+        # Platform dispatch — default telegram for backward compat.
+        platform_name = str(body.get("platform") or "telegram").strip().lower()
+        if platform_name not in ("telegram", "discord"):
+            return web.json_response(
+                _openai_error(f"Unsupported platform '{platform_name}' (telegram|discord)"),
+                status=400,
+            )
+
+        # Prefix is non-negotiable — the gateway agent reads this prefix to
+        # know the turn is a relay (came via realtime Laira, not typed).
+        prefixed = f"Realtime-Laira-Relay: {text}"
+
+        # Reach the live gateway runner. The WebhookAdapter precedent sets
+        # adapter.gateway_runner = self in _create_adapter; we mirror that
+        # for the API server adapter (see run.py change in this branch).
+        runner = getattr(self, "gateway_runner", None)
+        if runner is None:
+            return web.json_response(
+                {"error": {"message": "Gateway runner not available", "type": "server_error", "code": "no_runner"}},
+                status=503,
+            )
+
+        from gateway.config import Platform
+        from gateway.platforms.base import MessageEvent, MessageType
+        from gateway.session import SessionSource
+
+        echo_visible = os.getenv("HERMES_RELAY_ECHO_VISIBLE", "1").strip() not in ("0", "false", "no", "")
+
+        if platform_name == "telegram":
+            # ----- Telegram path (default, original behaviour) -----
+            target_user_id = os.getenv("HERMES_RELAY_USER_ID", "413720629").strip()
+            target_chat_id = os.getenv("HERMES_RELAY_CHAT_ID", target_user_id).strip()
+            target_user_name = os.getenv("HERMES_RELAY_USER_NAME", "Giannis").strip()
+
+            tg_adapter = runner.adapters.get(Platform.TELEGRAM)
+            if tg_adapter is None:
+                return web.json_response(
+                    {"error": {"message": "Telegram adapter not connected", "type": "server_error", "code": "no_telegram"}},
+                    status=503,
+                )
+
+            source = SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id=target_chat_id,
+                chat_type="dm",
+                user_id=target_user_id,
+                user_name=target_user_name,
+            )
+            event = MessageEvent(
+                text=prefixed,
+                message_type=MessageType.TEXT,
+                source=source,
+            )
+
+            # Echo the relayed message into the Telegram chat first so Giannis
+            # can SEE what realtime Laira sent before the agent reply lands.
+            # Failure of the echo is non-fatal — we still inject the event.
+            if echo_visible:
+                bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+                if bot_token:
+                    echo_text = f"🎙️ Realtime-Laira-Relay:\n{text}"
+                    if len(echo_text) > 4000:
+                        echo_text = echo_text[:4000]
+                    try:
+                        echo_payload = json.dumps({
+                            "chat_id": target_chat_id,
+                            "text": echo_text,
+                            "disable_web_page_preview": True,
+                        }).encode("utf-8")
+                        echo_req = urllib.request.Request(
+                            f"https://api.telegram.org/bot{bot_token}/sendMessage",
+                            data=echo_payload,
+                            headers={"Content-Type": "application/json"},
+                            method="POST",
+                        )
+                        def _do_echo_tg() -> None:
+                            try:
+                                with urllib.request.urlopen(echo_req, timeout=5.0) as r:
+                                    r.read()
+                            except Exception as exc:
+                                logger.warning("Relay echo bubble failed: %s", exc)
+                        await asyncio.to_thread(_do_echo_tg)
+                    except Exception as exc:
+                        logger.warning("Relay echo bubble setup failed: %s", exc)
+
+            try:
+                await tg_adapter.handle_message(event)
+            except Exception as e:
+                logger.exception("Relay injection failed")
+                return web.json_response(
+                    {"error": {"message": f"Relay injection failed: {e}", "type": "server_error", "code": "inject_failed"}},
+                    status=500,
+                )
+
+            logger.info(
+                "Relay inbound (telegram) — injected %d chars for user_id=%s chat_id=%s",
+                len(prefixed), target_user_id, target_chat_id,
+            )
+            return web.json_response({
+                "ok": True,
+                "platform": "telegram",
+                "chat_id": target_chat_id,
+                "user_id": target_user_id,
+                "injected_chars": len(prefixed),
+            })
+
+        # ----- Discord path -----
+        # Target Giannis Discord DM. The DM "channel" must be opened via
+        # REST first (Discord convention: there's no direct send-by-user-id
+        # primitive, you POST to /users/@me/channels {recipient_id} and
+        # use the returned channel id). The user_id IS the addressing
+        # primitive for the SessionSource, but the actual chat_id for
+        # both the echo bubble and the adapter must be the DM channel id.
+        target_user_id = os.getenv("HERMES_RELAY_DISCORD_USER_ID", "1085530082803716118").strip()
+        target_user_name = os.getenv("HERMES_RELAY_DISCORD_USER_NAME", "Giannis").strip()
+        # If an explicit DM channel id is pre-configured, prefer it over
+        # the runtime REST open. Otherwise open the DM on demand.
+        dm_channel_id = os.getenv("HERMES_RELAY_DISCORD_CHAT_ID", "").strip()
+
+        dc_adapter = runner.adapters.get(Platform.DISCORD)
+        if dc_adapter is None:
+            return web.json_response(
+                {"error": {"message": "Discord adapter not connected", "type": "server_error", "code": "no_discord"}},
+                status=503,
+            )
+
+        bot_token = os.getenv("DISCORD_BOT_TOKEN", "").strip()
+
+        if not dm_channel_id:
+            if not bot_token:
+                return web.json_response(
+                    {"error": {"message": "DISCORD_BOT_TOKEN not configured — cannot open DM channel", "type": "server_error", "code": "no_discord_token"}},
+                    status=503,
+                )
+
+            def _open_dm() -> Dict[str, Any]:
+                payload = json.dumps({"recipient_id": target_user_id}).encode("utf-8")
+                req = urllib.request.Request(
+                    "https://discord.com/api/v10/users/@me/channels",
+                    data=payload,
+                    headers={
+                        "Authorization": f"Bot {bot_token}",
+                        "Content-Type": "application/json",
+                        "User-Agent": "HermesGateway-Relay (https://github.com/0xyg3n/hermes-agent, 1.0)",
+                    },
+                    method="POST",
+                )
+                try:
+                    with urllib.request.urlopen(req, timeout=8.0) as r:
+                        return json.loads(r.read().decode("utf-8", errors="replace"))
+                except urllib.error.HTTPError as exc:
+                    try:
+                        err = exc.read().decode("utf-8", errors="replace")
+                    except Exception:
+                        err = str(exc)
+                    return {"_error": f"HTTP {exc.code}: {err[:200]}"}
+                except Exception as exc:
+                    return {"_error": f"{type(exc).__name__}: {exc}"}
+
+            dm_info = await asyncio.to_thread(_open_dm)
+            if not isinstance(dm_info, dict) or dm_info.get("_error") or not dm_info.get("id"):
+                err = (dm_info or {}).get("_error") if isinstance(dm_info, dict) else "unknown"
+                logger.warning("Relay: failed to open Discord DM channel: %s", err)
+                return web.json_response(
+                    {"error": {"message": f"Failed to open Discord DM channel: {err}", "type": "server_error", "code": "discord_dm_open_failed"}},
+                    status=502,
+                )
+            dm_channel_id = str(dm_info["id"])
+
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id=dm_channel_id,
+            chat_type="dm",
+            user_id=target_user_id,
+            user_name=target_user_name,
+        )
+        event = MessageEvent(
+            text=prefixed,
+            message_type=MessageType.TEXT,
+            source=source,
+        )
+
+        # Echo into the Discord DM channel so Giannis sees what relay sent.
+        # Non-fatal on failure, same convention as the Telegram path.
+        if echo_visible and bot_token:
+            echo_text = f"🎙️ Realtime-Laira-Relay:\n{text}"
+            if len(echo_text) > 1900:
+                echo_text = echo_text[:1900]
+            try:
+                echo_payload = json.dumps({"content": echo_text}).encode("utf-8")
+                echo_req = urllib.request.Request(
+                    f"https://discord.com/api/v10/channels/{dm_channel_id}/messages",
+                    data=echo_payload,
+                    headers={
+                        "Authorization": f"Bot {bot_token}",
+                        "Content-Type": "application/json",
+                        "User-Agent": "HermesGateway-Relay (https://github.com/0xyg3n/hermes-agent, 1.0)",
+                    },
+                    method="POST",
+                )
+                def _do_echo_dc() -> None:
+                    try:
+                        with urllib.request.urlopen(echo_req, timeout=5.0) as r:
+                            r.read()
+                    except Exception as exc:
+                        logger.warning("Relay echo bubble (discord) failed: %s", exc)
+                await asyncio.to_thread(_do_echo_dc)
+            except Exception as exc:
+                logger.warning("Relay echo bubble (discord) setup failed: %s", exc)
+
+        try:
+            await dc_adapter.handle_message(event)
+        except Exception as e:
+            logger.exception("Relay injection (discord) failed")
+            return web.json_response(
+                {"error": {"message": f"Relay injection failed: {e}", "type": "server_error", "code": "inject_failed"}},
+                status=500,
+            )
+
+        logger.info(
+            "Relay inbound (discord) — injected %d chars for user_id=%s chat_id=%s",
+            len(prefixed), target_user_id, dm_channel_id,
+        )
+        return web.json_response({
+            "ok": True,
+            "platform": "discord",
+            "chat_id": dm_channel_id,
+            "user_id": target_user_id,
+            "injected_chars": len(prefixed),
+        })
+
     async def _handle_stop_run(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs/{run_id}/stop — interrupt a running agent."""
         auth_err = self._check_auth(request)
@@ -2786,6 +3075,8 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/v1/responses", self._handle_responses)
             self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)
             self._app.router.add_delete("/v1/responses/{response_id}", self._handle_delete_response)
+            # Realtime relay — inject inbound messages as Giannis (Telegram DM)
+            self._app.router.add_post("/v1/relay/inbound", self._handle_relay_inbound)
             # Cron jobs management API
             self._app.router.add_get("/api/jobs", self._handle_list_jobs)
             self._app.router.add_post("/api/jobs", self._handle_create_job)
