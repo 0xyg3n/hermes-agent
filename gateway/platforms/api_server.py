@@ -4048,9 +4048,25 @@ class APIServerAdapter(BasePlatformAdapter):
 
         if platform_name == "telegram":
             # ----- Telegram path (default, original behaviour) -----
-            target_user_id = os.getenv("HERMES_RELAY_USER_ID", "413720629").strip()
-            target_chat_id = os.getenv("HERMES_RELAY_CHAT_ID", target_user_id).strip()
-            target_user_name = os.getenv("HERMES_RELAY_USER_NAME", "Giannis").strip()
+            # Defaults preserve original behaviour: relay to Giannis's DM.
+            # Body overrides let realtime-Laira target groups/channels too,
+            # so she can post into team threads (e.g. Logisek group) and
+            # fire those sessions. Numeric group ids are negative on TG.
+            env_user_id = os.getenv("HERMES_RELAY_USER_ID", "413720629").strip()
+            env_chat_id = os.getenv("HERMES_RELAY_CHAT_ID", env_user_id).strip()
+            env_user_name = os.getenv("HERMES_RELAY_USER_NAME", "Giannis").strip()
+
+            target_user_id = str(body.get("user_id") or env_user_id).strip()
+            target_chat_id = str(body.get("chat_id") or env_chat_id).strip()
+            target_user_name = str(body.get("user_name") or env_user_name).strip()
+            # chat_type: caller can pass "group"/"supergroup"/"channel"/"dm".
+            # Auto-detect by chat_id sign when not provided: TG group ids are
+            # always negative ints, DMs are positive (== user_id).
+            req_chat_type = str(body.get("chat_type") or "").strip().lower()
+            if req_chat_type in ("dm", "group", "supergroup", "channel"):
+                target_chat_type = req_chat_type
+            else:
+                target_chat_type = "group" if target_chat_id.startswith("-") else "dm"
 
             tg_adapter = runner.adapters.get(Platform.TELEGRAM)
             if tg_adapter is None:
@@ -4059,12 +4075,52 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=503,
                 )
 
+            # chat_name resolution — critical for downstream context header so
+            # the agent knows which group it's replying in (Seaverse vs Shophand
+            # vs Logisek etc.). Without this, a freshly-/new'd session has only
+            # the raw negative chat_id and the LLM picks the wrong project
+            # from MEMORY.md. May 23 2026 bugfix.
+            #   1. Explicit body.chat_name wins.
+            #   2. For groups, call Telegram getChat to fetch title (cached
+            #      via state.db on subsequent sessions anyway).
+            #   3. For DMs, fall back to user_name (matches native path).
+            target_chat_name = str(body.get("chat_name") or "").strip() or None
+            if not target_chat_name and target_chat_type != "dm":
+                bot_token_for_lookup = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+                if bot_token_for_lookup:
+                    try:
+                        lookup_payload = json.dumps({"chat_id": target_chat_id}).encode("utf-8")
+                        lookup_req = urllib.request.Request(
+                            f"https://api.telegram.org/bot{bot_token_for_lookup}/getChat",
+                            data=lookup_payload,
+                            headers={"Content-Type": "application/json"},
+                            method="POST",
+                        )
+                        def _do_get_chat() -> "Optional[str]":
+                            try:
+                                with urllib.request.urlopen(lookup_req, timeout=4.0) as r:
+                                    raw = r.read().decode("utf-8", errors="replace")
+                                obj = json.loads(raw)
+                                if obj.get("ok") and isinstance(obj.get("result"), dict):
+                                    res = obj["result"]
+                                    return (res.get("title") or res.get("username")
+                                            or res.get("first_name") or None)
+                            except Exception as exc:
+                                logger.warning("Relay getChat lookup failed for %s: %s", target_chat_id, exc)
+                            return None
+                        target_chat_name = await asyncio.to_thread(_do_get_chat)
+                    except Exception as exc:
+                        logger.warning("Relay getChat setup failed: %s", exc)
+            if not target_chat_name and target_chat_type == "dm":
+                target_chat_name = target_user_name or None
+
             source = SessionSource(
                 platform=Platform.TELEGRAM,
                 chat_id=target_chat_id,
-                chat_type="dm",
+                chat_type=target_chat_type,
                 user_id=target_user_id,
                 user_name=target_user_name,
+                chat_name=target_chat_name,
             )
             event = MessageEvent(
                 text=prefixed,
