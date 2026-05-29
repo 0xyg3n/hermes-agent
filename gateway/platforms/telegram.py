@@ -4957,6 +4957,15 @@ class TelegramAdapter(BasePlatformAdapter):
         msg = self._effective_update_message(update)
         if not msg or not msg.text:
             return
+
+        # Laira VC menu pending input consumer
+        try:
+            from gateway.platforms.telegram_laira_vc_menu import try_handle_pending_input
+            if await try_handle_pending_input(update, context):
+                return
+        except Exception:
+            logger.exception("laira-vc menu pending-input handler crashed")
+
         if not self._should_process_message(msg):
             if self._should_observe_unmentioned_group_message(msg):
                 self._observe_unmentioned_group_message(msg, MessageType.TEXT, update_id=update.update_id)
@@ -4973,6 +4982,15 @@ class TelegramAdapter(BasePlatformAdapter):
         msg = self._effective_update_message(update)
         if not msg or not msg.text:
             return
+
+        # Laira VC control menu (sidecar) - intercept /lvc
+        try:
+            from gateway.platforms.telegram_laira_vc_menu import try_handle_command
+            if await try_handle_command(update, context):
+                return
+        except Exception:
+            logger.exception("laira-vc menu command handler crashed")
+
         if not self._should_process_message(msg, is_command=True):
             return
         await self._ensure_forum_commands(msg)
