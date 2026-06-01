@@ -147,6 +147,11 @@ class AnthropicTransport(ProviderTransport):
         — the model's canonical way of signalling "nothing more to add" after
         a tool turn that already delivered the user-facing text. Treating it
         as invalid falsely retries a completed response.
+
+        ``pause_turn`` (interleaved-thinking-2025-05-14 beta) can also arrive
+        with an empty content list when the model pauses between thinking and
+        tool execution.  Rejecting it causes 3 pointless retries before the
+        session aborts.
         """
         if response is None:
             return False
@@ -154,7 +159,8 @@ class AnthropicTransport(ProviderTransport):
         if not isinstance(content_blocks, list):
             return False
         if not content_blocks:
-            return getattr(response, "stop_reason", None) == "end_turn"
+            sr = getattr(response, "stop_reason", None)
+            return sr in ("end_turn", "pause_turn")
         return True
 
     def extract_cache_stats(self, response: Any) -> Optional[Dict[str, int]]:
@@ -172,6 +178,7 @@ class AnthropicTransport(ProviderTransport):
     _STOP_REASON_MAP = {
         "end_turn": "stop",
         "tool_use": "tool_calls",
+        "pause_turn": "tool_calls",  # interleaved-thinking beta: pause to run pending tool calls
         "max_tokens": "length",
         "stop_sequence": "stop",
         "refusal": "content_filter",
