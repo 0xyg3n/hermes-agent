@@ -1431,6 +1431,21 @@ class AIAgent:
 
         Ensures conversations are never lost, even on errors or early returns.
         """
+        # Restore transient reasoning_details snapshot from the thinking-block
+        # signature recovery (see ``conversation_loop.py`` recovery branch).
+        # The recovery strips ``reasoning_details`` from ``messages`` so the
+        # retry's API call goes through without thinking blocks, but the
+        # canonical store must keep them intact — otherwise the conversation
+        # is permanently corrupted (every subsequent turn replays the
+        # stripped state, hits the same 400, exhausts retries, and the agent
+        # stops working).  Restoring here, *before* writing to disk/db,
+        # guarantees the strip is purely in-flight.
+        _snap = getattr(self, "_thinking_sig_rd_snapshot", None)
+        if _snap:
+            for _m, _rd in _snap:
+                if isinstance(_m, dict) and "reasoning_details" not in _m:
+                    _m["reasoning_details"] = _rd
+            self._thinking_sig_rd_snapshot = None
         self._drop_trailing_empty_response_scaffolding(messages)
         self._apply_persist_user_message_override(messages)
         self._session_messages = messages

@@ -4305,6 +4305,313 @@ class APIServerAdapter(BasePlatformAdapter):
             "injected_chars": len(prefixed),
         })
 
+    async def _helper_inject(self, adapter, event):
+        try:
+            await adapter.handle_message(event)
+        except Exception:
+            logger.exception("[helper_chat] inject failed")
+
+    def _helper_completion_obj(self, model_name, content):
+        import time as _t, uuid as _u
+        return {
+            "id": "chatcmpl-helper-" + _u.uuid4().hex[:12],
+            "object": "chat.completion",
+            "created": int(_t.time()),
+            "model": model_name,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        }
+
+    async def _helper_chat(self, request):
+        """POST /v1/helper/chat -- desktop Helper client bridge.
+
+        Sends the message into Giannis's live Telegram DM session as a Tier-1
+        turn (prefix "Helper-Relay: ") and streams the assistant reply +
+        tool-call verbose back to Helper as OpenAI chat.completions SSE.
+        Slash commands (/new /reset /stop /steer) are injected RAW so the
+        gateway handles them natively. Single-tenant: Giannis TG DM only.
+        Auth: Bearer <HERMES_RELAY_TOKEN> (falls back to API_SERVER_KEY).
+        """
+        import sqlite3 as _sqlite3
+        import time as _time
+        import uuid as _uuid
+        import re as _re
+
+        relay_token = os.getenv("HERMES_RELAY_TOKEN", "").strip() or self._api_key
+        if not relay_token:
+            return web.json_response(
+                {"error": {"message": "Helper bridge disabled: no relay token", "type": "invalid_request_error", "code": "relay_disabled"}},
+                status=503,
+            )
+        auth_header = request.headers.get("Authorization", "")
+        presented = auth_header[7:].strip() if auth_header.startswith("Bearer ") else ""
+        accepted = [t for t in (relay_token, self._api_key) if t]
+        if not presented or not any(hmac.compare_digest(presented, t) for t in accepted):
+            return web.json_response(
+                {"error": {"message": "Invalid Helper bridge token", "type": "invalid_request_error", "code": "invalid_api_key"}},
+                status=401,
+            )
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        def _extract_text(msgs):
+            for m in reversed(msgs or []):
+                if (m or {}).get("role") != "user":
+                    continue
+                c = m.get("content")
+                if isinstance(c, str):
+                    return c
+                if isinstance(c, list):
+                    parts = []
+                    for p in c:
+                        if isinstance(p, dict) and p.get("type") == "text":
+                            parts.append(str(p.get("text") or ""))
+                    return "\n".join(parts)
+                return str(c or "")
+            return ""
+
+        text = _extract_text(body.get("messages")).strip()
+        text = _re.sub(r"^\s*helper[\s\-]*relay\s*:?\s*", "", text, flags=_re.IGNORECASE).strip()
+        if not text:
+            return web.json_response(_openai_error("Missing user text"), status=400)
+        if len(text) > 3500:
+            text = text[:3500]
+
+        stream = bool(body.get("stream", True))
+        model_name = str(body.get("model") or "hermes-agent")
+
+        runner = getattr(self, "gateway_runner", None)
+        if runner is None:
+            return web.json_response(
+                {"error": {"message": "Gateway runner not available", "type": "server_error", "code": "no_runner"}},
+                status=503,
+            )
+        from gateway.config import Platform
+        from gateway.platforms.base import MessageEvent, MessageType
+        from gateway.session import SessionSource
+
+        tg_adapter = runner.adapters.get(Platform.TELEGRAM)
+        if tg_adapter is None:
+            return web.json_response(
+                {"error": {"message": "Telegram adapter not connected", "type": "server_error", "code": "no_telegram"}},
+                status=503,
+            )
+
+        gid = os.getenv("HERMES_RELAY_USER_ID", "413720629").strip()
+        gname = os.getenv("HERMES_RELAY_USER_NAME", "Giannis").strip()
+        source = SessionSource(
+            platform=Platform.TELEGRAM, chat_id=gid, chat_type="dm",
+            user_id=gid, user_name=gname, chat_name=gname,
+        )
+
+        is_command = text.startswith("/")
+        inject_text = text if is_command else ("Helper-Relay: " + text)
+        event = MessageEvent(text=inject_text, message_type=MessageType.TEXT, source=source)
+
+        try:
+            sdb = self._ensure_session_db()
+            db_path = getattr(sdb, "db_path", None) or getattr(sdb, "path", None)
+        except Exception:
+            db_path = None
+        if not db_path:
+            try:
+                from hermes_state import DEFAULT_DB_PATH
+                db_path = DEFAULT_DB_PATH
+            except Exception:
+                db_path = os.path.expanduser("~/.hermes/state.db")
+
+        def _max_id():
+            try:
+                c = _sqlite3.connect("file:%s?mode=ro" % db_path, uri=True)
+                try:
+                    r = c.execute("SELECT COALESCE(MAX(id),0) FROM messages").fetchone()
+                    return int(r[0]) if r else 0
+                finally:
+                    c.close()
+            except Exception:
+                return 0
+
+        baseline = await asyncio.to_thread(_max_id)
+        cid = "chatcmpl-helper-" + _uuid.uuid4().hex[:12]
+
+        async def _sse_open():
+            resp = web.StreamResponse(status=200, headers={
+                "Content-Type": "text/event-stream", "Cache-Control": "no-cache",
+                "Connection": "keep-alive", "X-Accel-Buffering": "no",
+            })
+            await resp.prepare(request)
+            role_chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(_time.time()),
+                          "model": model_name, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]}
+            await resp.write(("data: " + json.dumps(role_chunk) + "\n\n").encode())
+            return resp
+
+        async def _sse_send(resp, piece):
+            chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(_time.time()),
+                     "model": model_name, "choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": None}]}
+            await resp.write(("data: " + json.dumps(chunk) + "\n\n").encode())
+
+        async def _sse_finish(resp):
+            chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(_time.time()),
+                     "model": model_name, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+            await resp.write(("data: " + json.dumps(chunk) + "\n\n").encode())
+            await resp.write(b"data: [DONE]\n\n")
+
+        if is_command:
+            try:
+                await tg_adapter.handle_message(event)
+                ack = "command sent to Telegram DM session: " + text
+            except Exception as e:
+                ack = "command inject failed: " + str(e)
+            if not stream:
+                return web.json_response(self._helper_completion_obj(model_name, ack))
+            resp = await _sse_open()
+            await _sse_send(resp, ack)
+            await _sse_finish(resp)
+            return resp
+
+        # Echo the inbound Helper message into the Telegram DM so Giannis can
+        # see what arrived from the Helper client. The synthetic MessageEvent
+        # below is injected internally and never rendered to Telegram on its
+        # own, so without this the DM only ever shows Laira's reply.
+        try:
+            await tg_adapter.send(chat_id=gid, content=inject_text)
+        except Exception:
+            logger.exception("[helper_chat] inbound echo to Telegram failed")
+
+        inject_task = asyncio.create_task(self._helper_inject(tg_adapter, event))
+
+        def _poll(after_id, locked_sid):
+            rows = []
+            try:
+                c = _sqlite3.connect("file:%s?mode=ro" % db_path, uri=True)
+                c.row_factory = _sqlite3.Row
+                try:
+                    if locked_sid:
+                        cur = c.execute(
+                            "SELECT id,session_id,role,content,tool_calls,tool_name,finish_reason "
+                            "FROM messages WHERE id>? AND session_id=? ORDER BY id", (after_id, locked_sid))
+                    else:
+                        cur = c.execute(
+                            "SELECT id,session_id,role,content,tool_calls,tool_name,finish_reason "
+                            "FROM messages WHERE id>? ORDER BY id", (after_id,))
+                    for r in cur:
+                        rows.append(dict(r))
+                finally:
+                    c.close()
+            except Exception:
+                pass
+            return rows
+
+        def _render(r):
+            role = r.get("role")
+            if role == "assistant":
+                out = []
+                if r.get("content"):
+                    out.append(str(r["content"]))
+                tc = r.get("tool_calls")
+                if tc:
+                    try:
+                        for t in json.loads(tc):
+                            fn = (t.get("function") or {})
+                            name = fn.get("name") or t.get("name") or t.get("tool_name") or "tool"
+                            args = fn.get("arguments")
+                            if args is None:
+                                args = t.get("arguments") or ""
+                            if isinstance(args, (dict, list)):
+                                args = json.dumps(args, ensure_ascii=False)
+                            args = str(args)
+                            if len(args) > 220:
+                                args = args[:220] + "..."
+                            out.append("\n[tool] " + name + "(" + args + ")")
+                    except Exception:
+                        pass
+                return "\n".join(out).strip()
+            if role == "tool":
+                c = r.get("content") or ""
+                try:
+                    o = json.loads(c)
+                    if isinstance(o, dict) and "output" in o:
+                        c = o["output"]
+                except Exception:
+                    pass
+                c = str(c).strip().replace("\r", " ").replace("\n", " ")
+                if len(c) > 400:
+                    c = c[:400] + "..."
+                return ("   -> " + c) if c else ""
+            return ""
+
+        resp = await _sse_open() if stream else None
+        full = []
+        locked_sid = None
+        last_id = baseline
+        seen_terminal = False
+        start = _time.time()
+        last_write = _time.time()
+        idle_after_done = 0.0
+        norm = text.strip()
+        try:
+            while True:
+                rows = await asyncio.to_thread(_poll, last_id, locked_sid)
+                progressed = False
+                for r in rows:
+                    last_id = max(last_id, r["id"])
+                    if locked_sid is None:
+                        if r["role"] == "user" and r.get("content") and norm in str(r["content"]):
+                            locked_sid = r["session_id"]
+                        continue
+                    if r["role"] == "user":
+                        continue
+                    piece = _render(r)
+                    if piece:
+                        full.append(piece)
+                        progressed = True
+                        if stream:
+                            await _sse_send(resp, piece + "\n")
+                            last_write = _time.time()
+                    if r["role"] == "assistant" and r.get("finish_reason") in ("stop", "length", "error"):
+                        seen_terminal = True
+                done = inject_task.done()
+                if done and seen_terminal and not progressed:
+                    break
+                if _time.time() - start > 240:
+                    break
+                if done and locked_sid is None:
+                    idle_after_done += 0.6
+                    if idle_after_done > 12:
+                        break
+                # Heartbeat: when no content has been emitted for >10s (long
+                # tool-using turns), send an SSE comment frame so the Helper
+                # client's fetch read-timeout doesn't fire client-side while the
+                # turn is still running server-side.
+                if stream and resp is not None and (_time.time() - last_write) > 10:
+                    try:
+                        await resp.write(b": keepalive\n\n")
+                        last_write = _time.time()
+                    except Exception:
+                        break
+                await asyncio.sleep(0.6)
+        except Exception as e:
+            logger.exception("[helper_chat] stream loop error")
+            if stream and resp is not None:
+                try:
+                    await _sse_send(resp, "\n[bridge error] " + str(e))
+                except Exception:
+                    pass
+        try:
+            await asyncio.wait_for(asyncio.shield(inject_task), timeout=1.0)
+        except Exception:
+            pass
+        if stream:
+            if not full:
+                await _sse_send(resp, "(no reply captured -- session may still be working; check Telegram or resend)")
+            await _sse_finish(resp)
+            return resp
+        content = "\n".join(full).strip() or "(no reply captured)"
+        return web.json_response(self._helper_completion_obj(model_name, content))
+
     async def _handle_stop_run(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs/{run_id}/stop — interrupt a running agent."""
         auth_err = self._check_auth(request)
@@ -4417,6 +4724,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_delete("/v1/responses/{response_id}", self._handle_delete_response)
             # Realtime relay — inject inbound messages as Giannis (Telegram DM)
             self._app.router.add_post("/v1/relay/inbound", self._handle_relay_inbound)
+            self._app.router.add_post("/v1/helper/chat", self._helper_chat)
             # Cron jobs management API
             self._app.router.add_get("/api/jobs", self._handle_list_jobs)
             self._app.router.add_post("/api/jobs", self._handle_create_job)

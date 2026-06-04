@@ -2421,23 +2421,59 @@ def run_conversation(
                 # signature → HTTP 400.  Recovery: strip reasoning_details
                 # from all messages so the next retry sends no thinking
                 # blocks at all.  One-shot — don't retry infinitely.
+                #
+                # CRITICAL: the strip is TRANSIENT.  We snapshot the original
+                # reasoning_details before popping and restore them in
+                # ``_persist_session`` so the canonical store (state.db,
+                # session jsonl) never sees the stripped state.  Without
+                # restore, the strip permanently corrupts the conversation:
+                # subsequent turns replay the now-stripped state, hit the
+                # same 400 ("cannot be modified" / signature invalid),
+                # recovery fires again with nothing to strip,
+                # max_retries_exhausted, and the agent stops responding.
+                # Cascading compaction sessions then chain off the corrupted
+                # state.  The retry's api_kwargs are built from the stripped
+                # ``messages`` (no thinking blocks sent to Anthropic);
+                # ``_persist_session`` restores the snapshot before writing
+                # to disk so future turns can replay with intact signatures.
                 if (
                     classified.reason == FailoverReason.thinking_signature
                     and not thinking_sig_retry_attempted
                 ):
                     thinking_sig_retry_attempted = True
-                    for _m in messages:
-                        if isinstance(_m, dict):
+                    # Strip on the API-call-time list (``api_messages``).
+                    # ``api_messages`` is rebuilt into ``api_kwargs`` on
+                    # every retry inside this loop, so stripping here is
+                    # the only place that actually reaches the next call.
+                    # ``messages`` (the canonical store) is left alone,
+                    # so disk I/O stays intact.
+                    _api_stripped = 0
+                    for _m in api_messages:
+                        if isinstance(_m, dict) and "reasoning_details" in _m:
                             _m.pop("reasoning_details", None)
+                            _api_stripped += 1
+                    # Defense-in-depth: snapshot+restore on ``messages``
+                    # in case any future code path mutates ``messages`` on
+                    # this branch. ``_persist_session`` restores from the
+                    # snapshot before disk I/O. No-op today; cheap.
+                    _rd_snapshot = []
+                    for _m in messages:
+                        if isinstance(_m, dict) and "reasoning_details" in _m:
+                            _rd_snapshot.append(
+                                (_m, _m["reasoning_details"])
+                            )
+                    agent._thinking_sig_rd_snapshot = _rd_snapshot
                     agent._vprint(
-                        f"{agent.log_prefix}⚠️  Thinking block signature invalid — "
-                        f"stripped all thinking blocks, retrying...",
+                        f"{agent.log_prefix}⚠️  Thinking block signature invalid, "
+                        f"stripped reasoning_details from api_messages "
+                        f"for retry...",
                         force=True,
                     )
                     logger.warning(
                         "%sThinking block signature recovery: stripped "
-                        "reasoning_details from %d messages",
-                        agent.log_prefix, len(messages),
+                        "reasoning_details from %d api_messages "
+                        "(canonical messages unchanged)",
+                        agent.log_prefix, _api_stripped,
                     )
                     continue
 

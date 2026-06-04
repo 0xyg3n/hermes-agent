@@ -1901,6 +1901,13 @@ def _manage_thinking_signatures(
             last_assistant_idx = i
             break
 
+    def _has_tool_use(blocks: Any) -> bool:
+        if not isinstance(blocks, list):
+            return False
+        return any(
+            isinstance(b, dict) and b.get("type") == "tool_use" for b in blocks
+        )
+
     for idx, m in enumerate(result):
         if m.get("role") != "assistant" or not isinstance(m.get("content"), list):
             continue
@@ -1917,17 +1924,31 @@ def _manage_thinking_signatures(
                     continue
                 new_content.append(b)
             m["content"] = new_content or [{"type": "text", "text": "(empty)"}]
-        elif _is_third_party or idx != last_assistant_idx:
-            # Third-party: strip ALL thinking blocks (signatures are proprietary).
-            # Direct Anthropic: strip from non-latest assistant messages only.
+        elif _is_third_party:
+            # Third-party endpoint: strip ALL thinking blocks from every
+            # assistant message — signatures are Anthropic-proprietary.
+            stripped = [
+                b for b in m["content"]
+                if not (isinstance(b, dict) and b.get("type") in _THINKING_TYPES)
+            ]
+            m["content"] = stripped or [{"type": "text", "text": "(thinking elided)"}]
+        elif idx != last_assistant_idx and not _has_tool_use(m["content"]):
+            # Direct Anthropic, non-latest assistant message with NO tool_use:
+            # safe to strip thinking blocks.  These are pure-text final
+            # responses; Anthropic does not require their thinking blocks on
+            # replay, and stripping avoids stale-signature 400s after upstream
+            # context mutation. (Mirrors NousResearch/hermes-agent PR #24107.)
             stripped = [
                 b for b in m["content"]
                 if not (isinstance(b, dict) and b.get("type") in _THINKING_TYPES)
             ]
             m["content"] = stripped or [{"type": "text", "text": "(thinking elided)"}]
         else:
-            # Latest assistant on direct Anthropic: keep signed, downgrade unsigned
-            # to text so the reasoning isn't lost.
+            # Direct Anthropic, latest assistant OR any prior assistant that
+            # contains tool_use: keep signed thinking blocks (Anthropic's
+            # interleaved-thinking contract requires they round-trip
+            # byte-for-byte on tool-use turns); downgrade unsigned ones to
+            # plain text so the reasoning isn't lost.
             new_content = []
             for b in m["content"]:
                 if not isinstance(b, dict) or b.get("type") not in _THINKING_TYPES:
